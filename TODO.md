@@ -13,12 +13,12 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 
 ### XJ
 
-- [ ] 在登入節點確認可用的 GCC、CUDA module，寫好環境設定腳本
-- [ ] 寫 `.fvecs` / `.ivecs` 讀取
-- [ ] 寫串行 brute force，用 CPU 節點測試：前 100 個查詢在 SIFT1M 上 Recall@10 應為 1.0（距離相同的情況除外）
-- [ ] 用 CPU 節點跑完 SIFT1M 10,000 個查詢，確認程式正確
-- [ ] 提交一個短 sbatch 到 A40 節點，一次記錄 CPU 型號、實體核心數、NUMA、AVX2/AVX-512、GPU 拓撲，並跑 STREAM
-- [ ] 在 A40 節點上重跑串行 baseline，作為正式的加速比參考
+- [x] 在登入節點確認可用的 GCC、CUDA module，寫好環境設定腳本
+- [x] 寫 `.fvecs` / `.ivecs` 讀取
+- [x] 寫串行 brute force，用 CPU 節點測試：前 100 個查詢在 SIFT1M 上 Recall@10 應為 1.0（距離相同的情況除外）
+- [x] 用 CPU 節點跑完 SIFT1M 10,000 個查詢，確認程式正確
+- [x] 提交一個短 sbatch 到 A40 節點，一次記錄 CPU 型號、實體核心數、NUMA、AVX2/AVX-512、GPU 拓撲，並跑 STREAM
+- [x] 在 A40 節點上重跑串行 baseline，作為正式的加速比參考
 
 ### LL
 
@@ -52,11 +52,11 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 
 ### XJ
 
-- [ ] 寫 OpenMP + SIMD CPU 精排，先用假候選測試，結果要和 brute force 一致
-- [ ] 加 prefetch，可用參數開關
-- [ ] 寫 GPU zero-copy 精排（pinned host memory）
-- [ ] 寫預算 allocator：所有 device 配置都經過它，超過 B 就報錯
-- [ ] 用 `cudaMemGetInfo` 記錄基準值和搜尋峰值
+- [x] 寫 OpenMP + SIMD CPU 精排，先用假候選測試，結果要和 brute force 一致
+- [x] 加 prefetch，可用參數開關
+- [x] 寫 GPU zero-copy 精排（pinned host memory）
+- [x] 寫預算 allocator：所有 device 配置都經過它，超過 B 就報錯
+- [x] 用 `cudaMemGetInfo` 記錄基準值和搜尋峰值
 
 ### HS
 
