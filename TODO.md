@@ -24,7 +24,7 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 
 - [x] 寫 GPU brute force（cuBLAS GEMM + top-k），結果要和串行版一致
 - [ ] 產生 DEEP10M ground truth
-- [ ] 實測 GPU 記憶體頻寬和 PCIe 頻寬
+- [x] 實測 GPU 記憶體頻寬和 PCIe 頻寬
 
 ### HS
 
@@ -69,9 +69,9 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 
 ### Day 7 全員檢查點（最重要）
 
-- [ ] SIFT1M 端到端跑通：GPU 掃描 → 候選 ID → CPU 精排 → Recall
+- [x] SIFT1M 端到端跑通：GPU 掃描 → 候選 ID → CPU 精排 → Recall
 - [ ] 正確性檢查全部通過
-- [ ] CPU 精排和 GPU 精排的結果完全相同
+- [x] CPU 精排和 GPU 精排的結果完全相同
 
 未通過就先處理這裡，不要開始 4-bit、DEEP10M 或 pipeline。
 
