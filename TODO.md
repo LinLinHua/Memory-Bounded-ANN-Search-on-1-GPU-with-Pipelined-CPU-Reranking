@@ -8,8 +8,8 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 
 ## Day 1–3：環境與 baseline
 
-- [ ] **全員** 確認 CARC 帳號和共用目錄（資料不要放 home）
-- [ ] **全員** 建立共用 Git repo
+- [x] **全員** 確認 CARC 帳號和共用目錄（資料不要放 home）
+- [x] **全員** 建立共用 Git repo
 
 ### XJ
 
@@ -22,7 +22,7 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 
 ### LL
 
-- [ ] 寫 GPU brute force（cuBLAS GEMM + top-k），結果要和串行版一致
+- [x] 寫 GPU brute force（cuBLAS GEMM + top-k），結果要和串行版一致
 - [ ] 產生 DEEP10M ground truth
 - [ ] 實測 GPU 記憶體頻寬和 PCIe 頻寬
 
@@ -45,10 +45,10 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 
 ### LL
 
-- [ ] 寫 k-means，建立 IVF（SIFT1M L = 1,024；DEEP10M L = 4,096）
-- [ ] 寫 8-bit 掃描 kernel
-- [ ] 寫 1-bit 掃描 kernel（隨機旋轉 + residual sign + XOR/popcount）
-- [ ] 用 CUB 完成第一版 top-C
+- [x] 寫 k-means，建立 IVF（SIFT1M L = 1,024；DEEP10M L = 4,096）
+- [x] 寫 8-bit 掃描 kernel
+- [x] 寫 1-bit 掃描 kernel（隨機旋轉 + residual sign + XOR/popcount）
+- [x] 用 CUB 完成第一版 top-C
 
 ### XJ
 
