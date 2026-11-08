@@ -23,7 +23,7 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 ### LL
 
 - [x] 寫 GPU brute force（cuBLAS GEMM + top-k），結果要和串行版一致
-- [ ] 產生 DEEP10M ground truth
+- [x] 產生 DEEP10M ground truth
 - [x] 實測 GPU 記憶體頻寬和 PCIe 頻寬
 
 ### HS
