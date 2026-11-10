@@ -80,7 +80,7 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 ### LL
 
 - [x] 寫 4-bit 掃描 kernel
-- [ ] 用 Nsight Compute 量掃描頻寬，計算占 696 GB/s 的比例
+- [x] 用 Nsight Compute 量掃描頻寬，計算占 696 GB/s 的比例
 
 ### XJ
 
@@ -102,7 +102,7 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 
 ### LL
 
-- [ ] 用 Nsight 分析和 cuVS 的差距
+- [x] 用 Nsight 分析和 cuVS 的差距
 - [x] 優化 top-C
 
 ### XJ

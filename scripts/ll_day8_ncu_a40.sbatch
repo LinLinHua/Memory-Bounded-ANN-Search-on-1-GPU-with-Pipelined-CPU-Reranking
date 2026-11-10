@@ -7,7 +7,8 @@
 #SBATCH --mem=32G
 #SBATCH --time=00:30:00
 #SBATCH --output=logs/%x-%j.out
-# LL Day 8: Nsight Compute on the SIFT1M search (nprobe 64, C 100) for 8-, 4- and 1-bit codes.
+# LL Day 8: Nsight Compute on the SIFT1M search (nprobe 64, C 100) for 8-, 4- and 1-bit codes,
+# with the Day 11 top-C (select) and the Day 12 fused scan.
 # Records time and DRAM traffic of every kernel, then prints the scan kernel's bandwidth as a
 # share of the A40's 696 GB/s peak. Needs data/sift/ivf1024 (built by ll_day7_a40.sbatch).
 # Submit from the project root:
@@ -29,18 +30,20 @@ make -f ll.mk BUILD="$BUILD" -j4 "$BUILD/bench_scan"
 METRICS=gpu__time_duration.sum,dram__bytes_read.sum,dram__bytes_write.sum
 METRICS=$METRICS,dram__throughput.avg.pct_of_peak_sustained_elapsed
 
+for topc in select fused; do
 for bits in 8 4 1; do
-    echo "=== $bits-bit"
+    echo "=== $bits-bit, top-C $topc"
     # 1,024 queries in 4 batches; --reps 1 means one warm-up search and one timed search.
-    ncu --metrics "$METRICS" --csv --page raw --log-file "$OUT/sift_${bits}bit_raw.csv" \
+    ncu --metrics "$METRICS" --csv --page raw --log-file "$OUT/sift_${topc}_${bits}bit_raw.csv" \
         "$BUILD/bench_scan" --base "$DATA_DIR/sift_base.fvecs" --query "$DATA_DIR/sift_query.fvecs" \
         --gt "$DATA_DIR/sift_groundtruth.ivecs" --index "$DATA_DIR/ivf1024" \
-        --bits "$bits" --nprobe 64 --C 100 --nq 1024 --batch 256 --check 0 --reps 1 > /dev/null
-    python3 scripts/ncu_summary.py "$OUT/sift_${bits}bit_raw.csv" --out "$OUT/sift_${bits}bit_summary.csv"
+        --bits "$bits" --nprobe 64 --C 100 --nq 1024 --batch 256 --check 0 --reps 1 --topc $topc > /dev/null
+    python3 scripts/ncu_summary.py "$OUT/sift_${topc}_${bits}bit_raw.csv" --out "$OUT/sift_${topc}_${bits}bit_summary.csv"
+done
 done
 
-echo "=== full-detail report of one 4-bit scan launch (open with ncu-ui)"
-ncu --set full --kernel-name regex:scan_kernel --launch-skip 4 --launch-count 1 -f -o "$OUT/scan4_full" \
+echo "=== full-detail report of one fused 4-bit scan launch (open with ncu-ui)"
+ncu --set full --kernel-name regex:scan_fused_kernel --launch-skip 4 --launch-count 1 -f -o "$OUT/scan4_full" \
     "$BUILD/bench_scan" --base "$DATA_DIR/sift_base.fvecs" --query "$DATA_DIR/sift_query.fvecs" \
     --gt "$DATA_DIR/sift_groundtruth.ivecs" --index "$DATA_DIR/ivf1024" \
     --bits 4 --nprobe 64 --C 100 --nq 1024 --batch 256 --check 0 --reps 1 > /dev/null

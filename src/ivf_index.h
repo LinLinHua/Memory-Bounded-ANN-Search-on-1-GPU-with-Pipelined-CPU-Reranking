@@ -18,6 +18,7 @@ struct IvfIndex {
     std::vector<uint8_t> codes4;    // n x d/2; low nibble = even dimension
     std::vector<uint32_t> codes1;   // n x d/32; sign bits of the rotated residual
     std::vector<float> norms;       // n; |residual|
+    std::vector<float> factors1;    // n; <sign code / sqrt(d), unit rotated residual> (empty in old indexes)
     std::vector<float> sq_min;      // d; residual = sq_min + code * step
     std::vector<float> sq_step8;    // d
     std::vector<float> sq_step4;    // d
@@ -73,6 +74,7 @@ inline IvfIndex load_ivf(const std::string& dir) {
     ix.sq_step8 = read_raw<float>(dir + "/sq_step8.f32", d);
     ix.sq_step4 = read_raw<float>(dir + "/sq_step4.f32", d);
     ix.rotation = read_raw<float>(dir + "/rotation.f32", d * d);
+    if (std::ifstream(dir + "/factors1.f32").good()) ix.factors1 = read_raw<float>(dir + "/factors1.f32", n);
     if (ix.offsets.front() != 0 || ix.offsets.back() != n)
         throw std::runtime_error("list offsets do not cover all vectors in " + dir);
     return ix;

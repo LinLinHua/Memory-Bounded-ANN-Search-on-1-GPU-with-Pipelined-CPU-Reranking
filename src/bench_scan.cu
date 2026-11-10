@@ -11,7 +11,7 @@
 //   bench_scan --base B --query Q --gt G --index DIR
 //              [--bits 8,1] [--nprobe 16,32,64] [--C 100,1000] [--nq 10000] [--batch 256]
 //              [--check 100] [--reps 5] [--budget-mb 16384] [--csv results/scan_sift.csv]
-//              [--topc select|sort]   (select: radix select, default; sort: full CUB sort)
+//              [--topc fused|select|sort]   (see ivf_scan.cuh; fused is the default)
 
 #include <omp.h>
 
@@ -63,33 +63,60 @@ std::vector<std::pair<float, int32_t>> reference_scan(const IvfIndex& ix, const 
     std::partial_sort(lists.begin(), lists.begin() + nprobe, lists.end());
 
     std::vector<std::pair<float, int32_t>> all;
+    const int64_t words = d / 32;
     std::vector<float> qr(d), rotated(d);
-    std::vector<uint32_t> qbits(d / 32);
+    std::vector<uint32_t> planes(4 * words);  // bit planes of the 4-bit rotated query (1-bit codes)
+    auto quantize4 = [](float v, float lo, float step) {
+        return std::min(15, std::max(0, static_cast<int>(std::nearbyint((v - lo) / step))));
+    };
     for (int j = 0; j < nprobe; j++) {
         const int64_t l = lists[j].second;
         for (int64_t k = 0; k < d; k++) qr[k] = q[k] - ix.centroids[l * d + k];
 
-        float qn2 = 0.0f;
+        // Same steps as prepare_query<1> in ivf_scan.cu (fmaf matches the GPU's fused multiply-add).
+        float qn2 = 0.0f, lo = 0.0f, step = 1.0f, total = 0.0f;
         if (bits == 1) {
-            for (int64_t k = 0; k < d; k++) qn2 += qr[k] * qr[k];
-            for (int64_t t = 0; t < d; t++) {
-                float s = 0.0f;
-                for (int64_t i = 0; i < d; i++) s += qr[i] * ix.rotation[i * d + t];
-                rotated[t] = s;
+            const float* cent = &ix.centroids[l * d];
+            for (int64_t t = 0; t < d; t++) {  // R^T q - R^T c, like rotate_rows_kernel
+                float rq = 0.0f, rc = 0.0f;
+                for (int64_t i = 0; i < d; i++) {
+                    rq = std::fmaf(q[i], ix.rotation[i * d + t], rq);
+                    rc = std::fmaf(cent[i], ix.rotation[i * d + t], rc);
+                }
+                rotated[t] = rq - rc;
             }
-            std::fill(qbits.begin(), qbits.end(), 0u);
-            for (int64_t t = 0; t < d; t++)
-                if (rotated[t] > 0.0f) qbits[t / 32] |= 1u << (t % 32);
+            lo = rotated[0];
+            float hi = rotated[0];
+            for (int64_t i = 0; i < d; i++) {
+                qn2 = std::fmaf(qr[i], qr[i], qn2);
+                lo = std::min(lo, rotated[i]);
+                hi = std::max(hi, rotated[i]);
+            }
+            step = hi > lo ? (hi - lo) / 15.0f : 1.0f;
+            int sum_u = 0;
+            std::fill(planes.begin(), planes.end(), 0u);
+            for (int64_t t = 0; t < d; t++) {
+                const int u = quantize4(rotated[t], lo, step);
+                sum_u += u;
+                for (int b = 0; b < 4; b++)
+                    if ((u >> b) & 1) planes[b * words + t / 32] |= 1u << (t % 32);
+            }
+            total = float(d) * lo + step * float(sum_u);
         }
 
         for (int64_t row = ix.offsets[l]; row < ix.offsets[l + 1]; row++) {
             float est = 0.0f;
             if (bits == 1) {
-                int hamming = 0;
-                for (int64_t w = 0; w < d / 32; w++)
-                    hamming += __builtin_popcount(ix.codes1[row * (d / 32) + w] ^ qbits[w]);
-                const float qn = std::sqrt(qn2), rn = ix.norms[row];
-                est = qn2 + rn * rn - 2.0f * qn * rn * std::cos(float(M_PI) * hamming / float(d));
+                int ones = 0, weighted = 0;
+                for (int64_t w = 0; w < words; w++) {
+                    const uint32_t c = ix.codes1[row * words + w];
+                    ones += __builtin_popcount(c);
+                    for (int b = 0; b < 4; b++) weighted += (1 << b) * __builtin_popcount(c & planes[b * words + w]);
+                }
+                const float set_sum = lo * float(ones) + step * float(weighted);
+                const float ip = (2.0f * set_sum - total) * (1.0f / std::sqrt(float(d))) / ix.factors1[row];
+                const float rn = ix.norms[row];
+                est = qn2 + rn * rn - 2.0f * rn * ip;
             } else {
                 for (int64_t k = 0; k < d; k++) {
                     const uint8_t code = bits == 8 ? ix.codes8[row * d + k]
@@ -157,9 +184,10 @@ int main(int argc, char** argv) {
         const int reps = static_cast<int>(args.num("reps", 5));
         const int64_t budget_mb = args.num("budget-mb", 16384);
         const std::string csv_path = args.str("csv");
-        const std::string topc_name = args.str("topc", "select");
-        if (topc_name != "select" && topc_name != "sort") throw std::runtime_error("--topc must be select or sort");
-        const TopC topc = topc_name == "sort" ? TopC::Sort : TopC::Select;
+        const std::string topc_name = args.str("topc", "fused");
+        if (topc_name != "fused" && topc_name != "select" && topc_name != "sort")
+            throw std::runtime_error("--topc must be fused, select or sort");
+        const TopC topc = topc_name == "sort" ? TopC::Sort : topc_name == "select" ? TopC::Select : TopC::Fused;
         args.reject_unknown();
 
         // ---- data

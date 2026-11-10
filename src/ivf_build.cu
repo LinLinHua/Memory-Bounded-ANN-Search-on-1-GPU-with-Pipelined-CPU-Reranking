@@ -5,12 +5,14 @@
 //   2. assign every base vector to its nearest centroid, group vectors by list (CSR layout)
 //   3. encode residuals r = x - centroid on the CPU:
 //        8/4-bit : per-dimension scalar quantization over the residual range
-//        1-bit   : sign bits of r after a random orthogonal rotation, plus |r|
+//        1-bit   : sign bits of r after a random orthogonal rotation, plus |r| and the RaBitQ
+//                  factor <sign code / sqrt(d), r' / |r|> used by the 1-bit distance estimate
 //
 // The output matches src/build_ivf.py, so src/ref_scan.py can check this index too:
 //   centroids.f32 (L x d)   list_offsets.i64 (L+1)   ids.i32 (n, original ID of each row)
 //   codes8.u8 (n x d)   codes4.u8 (n x d/2, low nibble = even dim)   codes1.u32 (n x d/32)
-//   norms.f32 (n)   sq_min.f32, sq_step8.f32, sq_step4.f32 (d each)   rotation.f32 (d x d)
+//   norms.f32 (n)   factors1.f32 (n)   sq_min.f32, sq_step8.f32, sq_step4.f32 (d each)
+//   rotation.f32 (d x d)
 //   meta.json
 //
 // Usage:
@@ -312,7 +314,7 @@ int main(int argc, char** argv) {
 
         std::vector<uint8_t> codes8(n * d), codes4(n * d / 2);
         std::vector<uint32_t> codes1(n * d / 32, 0);
-        std::vector<float> norms(n);
+        std::vector<float> norms(n), factors1(n);
         auto quantize = [](float r, float lo, float step, int levels) {
             return static_cast<uint8_t>(std::clamp(std::nearbyint((r - lo) / step), 0.0f, float(levels)));
         };
@@ -337,8 +339,13 @@ int main(int argc, char** argv) {
                 std::fill(rotated.begin(), rotated.end(), 0.0f);
                 for (int64_t i = 0; i < d; i++)
                     for (int64_t t = 0; t < d; t++) rotated[t] += r[i] * rotation[i * d + t];
-                for (int64_t t = 0; t < d; t++)
+                float abs_sum = 0.0f;
+                for (int64_t t = 0; t < d; t++) {
                     if (rotated[t] > 0.0f) codes1[row * (d / 32) + t / 32] |= 1u << (t % 32);
+                    abs_sum += std::fabs(rotated[t]);
+                }
+                // <b / sqrt(d), r' / |r|> with b = sign(r'): how well the signs point along r'
+                factors1[row] = norms[row] > 0.0f ? abs_sum / (std::sqrt(float(d)) * norms[row]) : 1.0f;
             }
         }
         std::printf("encoding: %.1f s\n", seconds_since(t0));
@@ -351,6 +358,7 @@ int main(int argc, char** argv) {
         write_file(out_dir, "codes4.u8", codes4);
         write_file(out_dir, "codes1.u32", codes1);
         write_file(out_dir, "norms.f32", norms);
+        write_file(out_dir, "factors1.f32", factors1);
         write_file(out_dir, "sq_min.f32", vmin);
         write_file(out_dir, "sq_step8.f32", step8);
         write_file(out_dir, "sq_step4.f32", step4);
