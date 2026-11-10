@@ -1,8 +1,10 @@
-// GPU IVF scan for a batch of queries (LL, Day 4-7).
+// GPU IVF scan for a batch of queries (LL).
 //
 //   1. coarse search : GEMM against the centroids, keep the nprobe closest lists
 //   2. scan          : estimate the distance to every vector in those lists from its 8/4/1-bit code
-//   3. top-C         : CUB segmented sort of each query's estimates, keep the first C
+//   3. top-C         : keep the C smallest estimates per query, either by
+//                        TopC::Select - radix select + small in-block sort (default, C <= 1024)
+//                        TopC::Sort   - CUB segmented sort of every estimate (Day 7 version)
 //
 // Output follows the team's candidate format: original vector IDs, sorted by estimated distance,
 // padded with id -1 / distance +inf when a query sees fewer than C vectors.
@@ -17,10 +19,14 @@
 #include "device_budget.h"
 #include "ivf_index.h"
 
+enum class TopC { Select, Sort };
+
+constexpr int kMaxSelectC = 1024;  // largest C that TopC::Select supports
+
 struct ScanTiming {  // milliseconds, summed over all batches of the last search()
     double coarse = 0;  // query upload + coarse search + segment layout
     double scan = 0;    // distance estimation kernel
-    double select = 0;  // segmented sort + gather + candidate download
+    double select = 0;  // top-C selection + candidate download
     double total = 0;   // wall clock of search()
 };
 
@@ -29,7 +35,7 @@ public:
     // Copies what the chosen code width needs to the GPU. All device memory comes from budget,
     // with work buffers sized for max_batch queries, max_nprobe lists and max_C candidates.
     IvfScanner(const IvfIndex& index, int bits, int max_batch, int max_nprobe, int max_C,
-               DeviceBudget& budget);
+               DeviceBudget& budget, TopC topc = TopC::Select);
     ~IvfScanner();
     IvfScanner(const IvfScanner&) = delete;
     IvfScanner& operator=(const IvfScanner&) = delete;
@@ -50,6 +56,7 @@ private:
 
     const IvfIndex& ix_;
     const int bits_, max_batch_, max_nprobe_, max_C_;
+    const TopC topc_;
     DeviceBudget& budget_;
     std::vector<void*> owned_;  // freed through the budget in the destructor
     size_t index_bytes_ = 0, work_bytes_ = 0;
@@ -81,8 +88,8 @@ private:
     int* seg_start_ = nullptr;      // batch + 1; exclusive prefix sum of seg_len
     float* est_ = nullptr;          // capacity; estimated distances
     int32_t* est_row_ = nullptr;    // capacity; row of each estimate
-    float* sorted_est_ = nullptr;
-    int32_t* sorted_row_ = nullptr;
+    float* sorted_est_ = nullptr;   // TopC::Sort only
+    int32_t* sorted_row_ = nullptr; // TopC::Sort only
     void* cub_temp_ = nullptr;
     size_t cub_temp_bytes_ = 0;
     int32_t* out_ids_ = nullptr;    // batch x C

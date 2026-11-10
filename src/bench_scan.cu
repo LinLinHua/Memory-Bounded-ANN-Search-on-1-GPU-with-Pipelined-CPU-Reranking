@@ -11,6 +11,7 @@
 //   bench_scan --base B --query Q --gt G --index DIR
 //              [--bits 8,1] [--nprobe 16,32,64] [--C 100,1000] [--nq 10000] [--batch 256]
 //              [--check 100] [--reps 5] [--budget-mb 16384] [--csv results/scan_sift.csv]
+//              [--topc select|sort]   (select: radix select, default; sort: full CUB sort)
 
 #include <omp.h>
 
@@ -156,6 +157,9 @@ int main(int argc, char** argv) {
         const int reps = static_cast<int>(args.num("reps", 5));
         const int64_t budget_mb = args.num("budget-mb", 16384);
         const std::string csv_path = args.str("csv");
+        const std::string topc_name = args.str("topc", "select");
+        if (topc_name != "select" && topc_name != "sort") throw std::runtime_error("--topc must be select or sort");
+        const TopC topc = topc_name == "sort" ? TopC::Sort : TopC::Select;
         args.reject_unknown();
 
         // ---- data
@@ -194,14 +198,14 @@ int main(int argc, char** argv) {
         FILE* csv = open_csv(csv_path,
                              "bits,nprobe,C,nq,batch,index_mb,work_mb,scan_ms,qps,coarse_ms,scan_kernel_ms,"
                              "select_ms,cand_recall,recall10_no_rerank,recall10_rerank,cpu_rerank_ms,"
-                             "check_queries,max_rel_err,scan_mismatch,rerank_mismatch");
+                             "check_queries,max_rel_err,scan_mismatch,rerank_mismatch,topc");
         bool all_ok = true;
 
         for (const int64_t bits : bits_list) {
-            IvfScanner scanner(ix, static_cast<int>(bits), batch, max_nprobe, max_C, budget);
+            IvfScanner scanner(ix, static_cast<int>(bits), batch, max_nprobe, max_C, budget, topc);
             const double index_mb = scanner.index_bytes() / double(1 << 20);
             const double work_mb = scanner.work_bytes() / double(1 << 20);
-            std::printf("\n=== %lld-bit  index %.1f MB  work buffers %.1f MB\n", (long long)bits, index_mb, work_mb);
+            std::printf("\n=== %lld-bit  top-C %s  index %.1f MB  work buffers %.1f MB\n", (long long)bits, topc_name.c_str(), index_mb, work_mb);
 
             for (const int64_t nprobe : nprobe_list) {
                 for (const int64_t C : c_list) {
@@ -261,11 +265,12 @@ int main(int argc, char** argv) {
                                 parts.scan, parts.select, cand_recall, no_rerank, reranked, median(rerank_times),
                                 chk.max_rel, (long long)chk.mismatch, (long long)rerank_mismatch);
                     if (csv)
-                        std::fprintf(csv, "%lld,%lld,%lld,%lld,%d,%.2f,%.2f,%.3f,%.1f,%.3f,%.3f,%.3f,%.5f,%.5f,%.5f,%.3f,%lld,%.3e,%lld,%lld\n",
+                        std::fprintf(csv, "%lld,%lld,%lld,%lld,%d,%.2f,%.2f,%.3f,%.1f,%.3f,%.3f,%.3f,%.5f,%.5f,%.5f,%.3f,%lld,%.3e,%lld,%lld,%s\n",
                                      (long long)bits, (long long)nprobe, (long long)C, (long long)nq, batch,
                                      index_mb, work_mb, scan_ms, nq / (scan_ms / 1e3), parts.coarse, parts.scan,
                                      parts.select, cand_recall, no_rerank, reranked, median(rerank_times),
-                                     (long long)nc, chk.max_rel, (long long)chk.mismatch, (long long)rerank_mismatch);
+                                     (long long)nc, chk.max_rel, (long long)chk.mismatch, (long long)rerank_mismatch,
+                                     topc_name.c_str());
                 }
             }
         }

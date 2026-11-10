@@ -103,7 +103,7 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 ### LL
 
 - [ ] 用 Nsight 分析和 cuVS 的差距
-- [ ] 優化 top-C
+- [x] 優化 top-C
 
 ### XJ
 

@@ -14,6 +14,8 @@ namespace {
 
 constexpr unsigned kFullMask = 0xffffffffu;
 constexpr int kScanThreads = 256;
+constexpr int kSelectThreads = 512;
+constexpr int kSelectItems = kMaxSelectC / kSelectThreads;  // per thread in the final sort
 
 struct ScanParams {
     const float* queries;    // batch x d
@@ -150,7 +152,7 @@ __global__ void scan_kernel(ScanParams p) {
     }
 }
 
-// Keeps the first C sorted estimates of each query and maps rows to original IDs.
+// TopC::Sort: keeps the first C sorted estimates of each query and maps rows to original IDs.
 __global__ void gather_kernel(const float* sorted_est, const int32_t* sorted_row, const int* seg_start,
                               const int32_t* ids, int C, int32_t* out_ids, float* out_dist) {
     const int q = blockIdx.x;
@@ -160,6 +162,103 @@ __global__ void gather_kernel(const float* sorted_est, const int32_t* sorted_row
         const bool valid = c < len;
         out_ids[q * C + c] = valid ? ids[sorted_row[begin + c]] : -1;
         out_dist[q * C + c] = valid ? sorted_est[begin + c] : INFINITY;
+    }
+}
+
+// Float -> unsigned key with the same order, so floats can be compared and bucketed as integers.
+__device__ inline uint32_t order_key(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+__device__ inline float key_to_float(uint32_t key) {
+    return __uint_as_float((key & 0x80000000u) ? (key & 0x7fffffffu) : ~key);
+}
+
+// TopC::Select, one block per query:
+//   1. radix select: find the C-th smallest estimate, 8 bits at a time (4 histogram passes)
+//   2. copy every estimate below it, plus enough that are equal to it, into shared memory
+//   3. sort those C entries in shared memory and write them out
+// Each pass only reads the query's estimates; nothing else is written to global memory.
+__global__ void select_topc_kernel(const float* est, const int32_t* est_row, const int* seg_start,
+                                   const int32_t* ids, int C, int32_t* out_ids, float* out_dist) {
+    using BlockSort = cub::BlockRadixSort<uint32_t, kSelectThreads, kSelectItems, int32_t>;
+    __shared__ typename BlockSort::TempStorage sort_storage;
+    __shared__ uint32_t kept_key[kMaxSelectC];
+    __shared__ int32_t kept_row[kMaxSelectC];
+    __shared__ int hist[256];
+    __shared__ uint32_t shared_prefix;
+    __shared__ int shared_need, n_below, n_equal;
+
+    const int q = blockIdx.x;
+    const int begin = seg_start[q];
+    const int len = seg_start[q + 1] - begin;
+    const float* e = est + begin;
+    const int32_t* r = est_row + begin;
+    const int keep = min(C, len);
+    const bool take_all = keep == len;
+
+    // ---- 1. after this loop, threshold = key of the keep-th smallest estimate, and
+    //         need = how many estimates equal to the threshold must be kept
+    uint32_t threshold = 0, mask = 0;
+    int need = keep;
+    if (!take_all) {
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;
+            __syncthreads();
+            for (int i = threadIdx.x; i < len; i += blockDim.x) {
+                const uint32_t key = order_key(e[i]);
+                if ((key & mask) == threshold) atomicAdd(&hist[(key >> shift) & 0xffu], 1);
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {  // the bucket that holds the need-th smallest key
+                int before = 0, digit = 0;
+                while (before + hist[digit] < need) before += hist[digit++];
+                shared_prefix = threshold | (uint32_t(digit) << shift);
+                shared_need = need - before;
+            }
+            __syncthreads();
+            threshold = shared_prefix;
+            need = shared_need;
+            mask |= 0xffu << shift;
+        }
+    }
+
+    // ---- 2. copy the kept candidates to shared memory (in no particular order yet)
+    if (threadIdx.x == 0) n_below = n_equal = 0;
+    __syncthreads();
+    const int below_total = take_all ? keep : keep - need;  // keys strictly below the threshold
+    for (int i = threadIdx.x; i < len; i += blockDim.x) {
+        const uint32_t key = order_key(e[i]);
+        int slot = -1;
+        if (take_all || key < threshold) {
+            slot = atomicAdd(&n_below, 1);
+        } else if (key == threshold) {
+            const int j = atomicAdd(&n_equal, 1);
+            if (j < need) slot = below_total + j;
+        }
+        if (slot >= 0) {
+            kept_key[slot] = key;
+            kept_row[slot] = r[i];
+        }
+    }
+    __syncthreads();
+
+    // ---- 3. sort in shared memory; unused slots get the largest key so they sort last
+    uint32_t keys[kSelectItems];
+    int32_t rows[kSelectItems];
+    for (int k = 0; k < kSelectItems; k++) {
+        const int slot = threadIdx.x * kSelectItems + k;
+        keys[k] = slot < keep ? kept_key[slot] : 0xffffffffu;
+        rows[k] = slot < keep ? kept_row[slot] : -1;
+    }
+    BlockSort(sort_storage).Sort(keys, rows);
+    for (int k = 0; k < kSelectItems; k++) {
+        const int c = threadIdx.x * kSelectItems + k;
+        if (c >= C) continue;
+        const bool valid = c < keep;
+        out_ids[q * C + c] = valid ? ids[rows[k]] : -1;
+        out_dist[q * C + c] = valid ? key_to_float(keys[k]) : INFINITY;
     }
 }
 
@@ -180,13 +279,16 @@ T* IvfScanner::upload(const std::vector<T>& v, const char* tag) {
 }
 
 IvfScanner::IvfScanner(const IvfIndex& index, int bits, int max_batch, int max_nprobe, int max_C,
-                       DeviceBudget& budget)
-    : ix_(index), bits_(bits), max_batch_(max_batch), max_nprobe_(max_nprobe), max_C_(max_C), budget_(budget) {
+                       DeviceBudget& budget, TopC topc)
+    : ix_(index), bits_(bits), max_batch_(max_batch), max_nprobe_(max_nprobe), max_C_(max_C),
+      topc_(topc), budget_(budget) {
     const int64_t d = ix_.d, L = ix_.nlist;
     if (bits != 1 && bits != 4 && bits != 8) throw std::runtime_error("bits must be 1, 4 or 8");
     if (d % 32 != 0) throw std::runtime_error("the scan needs d to be a multiple of 32");
     if (max_nprobe < 1 || max_nprobe > std::min<int64_t>(L, kMaxTopK))
         throw std::runtime_error("nprobe must be between 1 and min(nlist, 256)");
+    if (topc == TopC::Select && max_C > kMaxSelectC)
+        throw std::runtime_error("top-C select supports C <= 1024; use the sort version for larger C");
 
     CUDA_CHECK(cudaStreamCreate(&stream_));
     for (auto& e : events_) CUDA_CHECK(cudaEventCreate(&e));
@@ -234,16 +336,18 @@ IvfScanner::IvfScanner(const IvfIndex& index, int bits, int max_batch, int max_n
     seg_start_ = alloc<int>(max_batch + 1, "segment starts");
     est_ = alloc<float>(capacity_, "estimates");
     est_row_ = alloc<int32_t>(capacity_, "estimate rows");
-    sorted_est_ = alloc<float>(capacity_, "sorted estimates");
-    sorted_row_ = alloc<int32_t>(capacity_, "sorted rows");
     out_ids_ = alloc<int32_t>(int64_t(max_batch) * max_C, "candidate ids");
     out_dist_ = alloc<float>(int64_t(max_batch) * max_C, "candidate dists");
 
     size_t sort_bytes = 0, scan_bytes = 0;
-    CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
-        nullptr, sort_bytes, est_, sorted_est_, est_row_, sorted_row_, static_cast<int>(capacity_),
-        max_batch, seg_start_, seg_start_ + 1, 0, 32, stream_));
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, seg_len_, seg_start_, max_batch + 1, stream_));
+    if (topc == TopC::Sort) {  // the full sort needs a second copy of the estimates plus temp space
+        sorted_est_ = alloc<float>(capacity_, "sorted estimates");
+        sorted_row_ = alloc<int32_t>(capacity_, "sorted rows");
+        CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(
+            nullptr, sort_bytes, est_, sorted_est_, est_row_, sorted_row_, static_cast<int>(capacity_),
+            max_batch, seg_start_, seg_start_ + 1, 0, 32, stream_));
+    }
     cub_temp_bytes_ = std::max(sort_bytes, scan_bytes);
     cub_temp_ = alloc<char>(cub_temp_bytes_, "cub temp");
     work_bytes_ = budget_.used() - used_before - index_bytes_;
@@ -297,10 +401,15 @@ void IvfScanner::search_batch(const float* queries, int nqb, int nprobe, int C, 
     CUDA_CHECK(cudaGetLastError());
     size_t temp = cub_temp_bytes_;
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(cub_temp_, temp, seg_len_, seg_start_, nqb + 1, stream_));
-    CUDA_CHECK(cudaMemcpyAsync(h_total_, seg_start_ + nqb, sizeof(int), cudaMemcpyDeviceToHost, stream_));
     CUDA_CHECK(cudaEventRecord(events_[1], stream_));
-    CUDA_CHECK(cudaStreamSynchronize(stream_));  // the sort below needs the total on the host
-    const int total = *h_total_;
+
+    // The full sort needs the total number of estimates on the host; the select version does not.
+    int total = 0;
+    if (topc_ == TopC::Sort) {
+        CUDA_CHECK(cudaMemcpyAsync(h_total_, seg_start_ + nqb, sizeof(int), cudaMemcpyDeviceToHost, stream_));
+        CUDA_CHECK(cudaStreamSynchronize(stream_));
+        total = *h_total_;
+    }
 
     // ---- 2. distance estimates for every vector in the probed lists
     ScanParams p{queries_, centroids_, offsets_, probe_list_, probe_start_, seg_start_, codes_,
@@ -317,16 +426,22 @@ void IvfScanner::search_batch(const float* queries, int nqb, int nprobe, int C, 
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(events_[2], stream_));
 
-    // ---- 3. top-C: sort each query's segment, keep the first C
-    temp = 0;
-    CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(nullptr, temp, est_, sorted_est_, est_row_,
-                                                        sorted_row_, total, nqb, seg_start_,
-                                                        seg_start_ + 1, 0, 32, stream_));
-    if (temp > cub_temp_bytes_) throw std::runtime_error("CUB needs more temp memory than reserved");
-    CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(cub_temp_, temp, est_, sorted_est_, est_row_,
-                                                        sorted_row_, total, nqb, seg_start_,
-                                                        seg_start_ + 1, 0, 32, stream_));
-    gather_kernel<<<nqb, 128, 0, stream_>>>(sorted_est_, sorted_row_, seg_start_, ids_, C, out_ids_, out_dist_);
+    // ---- 3. top-C per query
+    if (topc_ == TopC::Select) {
+        select_topc_kernel<<<nqb, kSelectThreads, 0, stream_>>>(est_, est_row_, seg_start_, ids_, C,
+                                                                out_ids_, out_dist_);
+    } else {
+        temp = 0;
+        CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(nullptr, temp, est_, sorted_est_, est_row_,
+                                                            sorted_row_, total, nqb, seg_start_,
+                                                            seg_start_ + 1, 0, 32, stream_));
+        if (temp > cub_temp_bytes_) throw std::runtime_error("CUB needs more temp memory than reserved");
+        CUDA_CHECK(cub::DeviceSegmentedRadixSort::SortPairs(cub_temp_, temp, est_, sorted_est_, est_row_,
+                                                            sorted_row_, total, nqb, seg_start_,
+                                                            seg_start_ + 1, 0, 32, stream_));
+        gather_kernel<<<nqb, 128, 0, stream_>>>(sorted_est_, sorted_row_, seg_start_, ids_, C, out_ids_,
+                                                out_dist_);
+    }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpyAsync(h_ids_, out_ids_, size_t(nqb) * C * sizeof(int32_t),
                                cudaMemcpyDeviceToHost, stream_));
