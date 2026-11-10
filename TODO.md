@@ -79,7 +79,7 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 
 ### LL
 
-- [ ] 寫 4-bit 掃描 kernel
+- [x] 寫 4-bit 掃描 kernel
 - [ ] 用 Nsight Compute 量掃描頻寬，計算占 696 GB/s 的比例
 
 ### XJ
