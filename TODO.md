@@ -119,7 +119,7 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 
 ## Day 13–14：報告與提交
 
-- [ ] **LL** 寫 kernel 和分析章節
+- [x] **LL** 寫 kernel 和分析章節
 - [ ] **XJ** 寫 pipeline 和精排章節
 - [ ] **HS** 整合報告、README、limitations
 - [ ] **全員** 按 README 從頭跑一次，確認其他人也能重現

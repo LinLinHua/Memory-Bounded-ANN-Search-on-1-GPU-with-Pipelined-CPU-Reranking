@@ -26,6 +26,7 @@ Team: Lin Lin (LL, GPU kernels) · Xinyi (XJ, CPU rerank / pipeline) · He Sui (
 | src/build_ivf.py, src/ref_scan.py | NumPy reference for the same index format |
 | scripts/ | CARC job scripts (A40) and data preparation |
 | docs/deep10m.md | How DEEP10M is prepared |
+| docs/ll_kernels_and_analysis.md | GPU kernels and performance analysis (report chapter) |
 | TODO.md | Task list and owners |
 
 ## Run on CARC
