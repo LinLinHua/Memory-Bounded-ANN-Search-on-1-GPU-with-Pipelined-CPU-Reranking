@@ -1,7 +1,8 @@
 // Serial brute-force nearest neighbor search, used as the correctness and speedup baseline.
 //
 // Usage:
-//   serial_bruteforce --base B.fvecs --query Q.fvecs --gt G.ivecs [--nq N] [--k K] [--csv out.csv]
+//   serial_bruteforce --base B --query Q --gt G [--nq N] [--k K] [--csv out.csv]
+//   B and Q are .fvecs or .fbin, G is .ivecs or .ibin (see dataset_io.h).
 
 #include <algorithm>
 #include <chrono>
@@ -16,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-#include "vecs_io.h"
+#include "dataset_io.h"
 
 static inline float l2_sqr(const float* a, const float* b, int64_t d) {
     float sum = 0.0f;
@@ -70,9 +71,9 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--base, --query and --gt are required");
 
         int64_t n, d, nq_file, dq, ngt, kgt;
-        const auto base = read_vecs<float>(base_path, n, d);
-        const auto queries = read_vecs<float>(query_path, nq_file, dq);
-        const auto gt = read_vecs<int32_t>(gt_path, ngt, kgt);
+        const auto base = load_vectors<float>(base_path, n, d);
+        const auto queries = load_vectors<float>(query_path, nq_file, dq);
+        const auto gt = load_vectors<int32_t>(gt_path, ngt, kgt);
 
         if (d != dq) throw std::runtime_error("base and query dimensions differ");
         if (ngt < nq_file) throw std::runtime_error("ground truth has fewer rows than queries");

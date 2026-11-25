@@ -23,10 +23,13 @@ Team: Lin Lin (LL, GPU kernels) · Xinyi (XJ, CPU rerank / pipeline) · He Sui (
 | src/cpu_rerank.cpp, src/gpu_rerank.cu | CPU rerank (OpenMP + SIMD) and GPU zero-copy rerank |
 | src/device_budget.h | Enforces the GPU memory budget |
 | src/bench_scan.cu | End-to-end run with correctness checks |
+| src/bench_pipeline.cu | Sequential vs pipelined search, throughput and per-batch latency |
+| src/bench_rerank_breakdown.cu | CPU vs GPU rerank on real candidates, split into parts; OpenMP scaling |
 | src/build_ivf.py, src/ref_scan.py | NumPy reference for the same index format |
 | scripts/ | CARC job scripts (A40) and data preparation |
 | docs/deep10m.md | How DEEP10M is prepared |
 | docs/ll_kernels_and_analysis.md | GPU kernels and performance analysis (report chapter) |
+| docs/xj_pipeline_and_rerank.md | CPU rerank and pipeline (report chapter) |
 | TODO.md | Task list and owners |
 
 ## Run on CARC
@@ -37,6 +40,8 @@ Data lives in data/ (not in Git): SIFT1M in data/sift, DEEP10M in data/deep10m
     sbatch scripts/ll_day1_a40.sbatch     # bandwidth + GPU brute force on SIFT1M
     sbatch scripts/ll_day7_a40.sbatch     # build the SIFT1M index, end-to-end check
     sbatch scripts/ll_deep10m_a40.sbatch  # DEEP10M ground truth, index, end-to-end check
-    sbatch scripts/rerank_a40.sbatch      # CPU vs GPU rerank
+    sbatch scripts/rerank_a40.sbatch      # CPU vs GPU rerank on synthetic candidates
+    sbatch scripts/xj_pipeline_a40.sbatch # rerank breakdown, pipeline, scaling, serial baseline
+    python3 scripts/xj_summary.py         # tables for results 3, 4 and 5
 
 Logs go to logs/, result tables (CSV) to results/.

@@ -84,9 +84,9 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 
 ### XJ
 
-- [ ] 寫 sequential 版和 pipeline 版（CUDA streams + 深度 1 的佇列）
+- [ ] 寫 sequential 版和 pipeline 版（CUDA streams + 深度 1 的佇列） — 程式：`bench_pipeline`，待 A40 執行（`scripts/xj_pipeline_a40.sbatch`）
 - [ ] 確認 pipeline 和 sequential 回傳的結果完全相同
-- [ ] 完成精排時間拆解（結果 3）：C 從 10 到 1,000
+- [ ] 完成精排時間拆解（結果 3）：C 從 10 到 1,000 — 程式：`bench_rerank_breakdown`，待 A40 執行
   - 候選 ID 傳輸
   - 讀取向量或 PCIe 傳輸
   - 距離計算
@@ -108,9 +108,9 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 ### XJ
 
 - [ ] 量 batch 1、16 的 P50、P99 latency
-- [ ] 量 OpenMP scaling：1 個執行緒到全部核心
+- [ ] 量 OpenMP scaling：1 個執行緒到全部核心 — 程式：`bench_rerank_breakdown`，待 A40 執行
 - [ ] 比較 pipeline 和 sequential 的 QPS，對照加速公式（結果 4）
-- [ ] 計算相對串行 baseline 的端到端加速（結果 5）
+- [ ] 計算相對串行 baseline 的端到端加速（結果 5） — `scripts/xj_summary.py`；DEEP10M 串行版改為可讀 .fbin
 
 ### HS
 
