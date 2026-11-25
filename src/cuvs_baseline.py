@@ -7,9 +7,16 @@ computed after the same exact rerank (NumPy, not timed), so the numbers line up 
   ivf_flat : FP32 vectors in the lists (4 * d bytes per vector), the full-precision reference
   ivf_pq   : pq_dim = d / 2 sub-vectors of 8 bits (d / 2 bytes per vector, same size as our 4-bit)
 
+By default the queries are on the GPU before timing starts and all of them go to one search call.
+To time it the way bench_scan times our scan:
+  --batch B      queries per search call (0 = all at once, the default)
+  --transfer 1   the timed loop starts from queries in pinned host memory: upload each batch,
+                 search, and download its ids and distances (bench_scan does the same)
+
 Usage:
   cuvs_baseline.py --base B --query Q --gt G --nlist 1024 [--nprobe 16,32,64] [--C 100,1000]
-                   [--algo ivf_pq,ivf_flat] [--reps 5] [--csv results/cuvs_sift.csv]
+                   [--algo ivf_pq,ivf_flat] [--reps 5] [--batch 0] [--transfer 0]
+                   [--csv results/cuvs_sift.csv]
 """
 import argparse
 import csv
@@ -17,6 +24,7 @@ import os
 import time
 
 import cupy as cp
+import cupyx
 import numpy as np
 from cuvs.neighbors import ivf_flat, ivf_pq
 
@@ -61,6 +69,27 @@ def timed_search(search, reps):
     return result, float(np.median(times))
 
 
+def batched_search(module, params, index, queries, C, batch, transfer):
+    """Searches `queries` in calls of `batch` queries (0 = one call). With transfer, `queries` is
+    pinned host memory: each batch is uploaded, searched, and its results are downloaded."""
+    nq = len(queries)
+    step = nq if batch <= 0 else batch
+    ids_out, dist_out = [], []
+    for i in range(0, nq, step):
+        q = cp.asarray(queries[i:i + step]) if transfer else queries[i:i + step]
+        dist, ids = module.search(params, index, q, C)
+        if transfer:
+            ids_out.append(cp.asnumpy(cp.asarray(ids)))
+            dist_out.append(cp.asnumpy(cp.asarray(dist)))
+        else:
+            ids_out.append(cp.asarray(ids))
+            dist_out.append(cp.asarray(dist))
+    if len(ids_out) == 1:
+        return dist_out[0], ids_out[0]
+    cat = np.concatenate if transfer else cp.concatenate
+    return cat(dist_out), cat(ids_out)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--base", required=True)
@@ -71,6 +100,8 @@ def main():
     p.add_argument("--C", default="100,1000")
     p.add_argument("--algo", default="ivf_pq,ivf_flat")
     p.add_argument("--reps", type=int, default=5)
+    p.add_argument("--batch", type=int, default=0, help="queries per search call (0 = all)")
+    p.add_argument("--transfer", type=int, default=0, help="1 = time upload and download too")
     p.add_argument("--csv", default="")
     a = p.parse_args()
 
@@ -80,6 +111,10 @@ def main():
     n, d = base.shape
     print(f"base {n} x {d}, queries {len(queries)}, nlist {a.nlist}")
     base_gpu, queries_gpu = cp.asarray(base), cp.asarray(queries)
+    queries_pinned = cupyx.empty_pinned(queries.shape, dtype=np.float32)
+    queries_pinned[...] = queries
+    search_queries = queries_pinned if a.transfer else queries_gpu
+    print(f"batch {a.batch or 'all'}, transfer timed: {bool(a.transfer)}")
 
     rows = []
     for algo in a.algo.split(","):
@@ -100,7 +135,8 @@ def main():
         for nprobe in map(int, a.nprobe.split(",")):
             for C in map(int, a.C.split(",")):
                 params = module.SearchParams(n_probes=nprobe)
-                (dist, ids), ms = timed_search(lambda: module.search(params, index, queries_gpu, C), a.reps)
+                (dist, ids), ms = timed_search(
+                    lambda: batched_search(module, params, index, search_queries, C, a.batch, a.transfer), a.reps)
                 cand = cp.asnumpy(cp.asarray(ids)).astype(np.int64)
                 no_rerank = recall_at_10(cand, gt)
                 reranked = recall_at_10(exact_rerank(base, queries, cand), gt)
@@ -110,7 +146,7 @@ def main():
                 rows.append(dict(algo=algo, nlist=a.nlist, nprobe=nprobe, C=C, nq=len(queries),
                                  search_ms=round(ms, 3), qps=round(qps, 1), index_mb=round(index_mb, 1),
                                  build_s=round(build_s, 2), recall10_no_rerank=round(no_rerank, 5),
-                                 recall10_rerank=round(reranked, 5)))
+                                 recall10_rerank=round(reranked, 5), batch=a.batch, transfer=a.transfer))
 
     if a.csv:
         os.makedirs(os.path.dirname(a.csv) or ".", exist_ok=True)
