@@ -13,11 +13,13 @@
 //              [--check 100] [--reps 5] [--budget-mb 16384] [--csv results/scan_sift.csv]
 //              [--topc fused|select|sort]   (see ivf_scan.cuh; fused is the default)
 //
-// Device memory (docs/measurement.md), the same way as every baseline: cudaMemGetInfo above a
-// baseline taken after one throwaway warm-up scanner (so one-time library setup is not counted).
+// Device memory (docs/measurement.md), the same way as every baseline: cudaMemGetInfo above the
+// memory in use just before the scanner is created (CUDA context and cuBLAS loaded, as for every
+// baseline), so every allocation the scanner makes, workspaces included, is counted.
 // gpu_index_mb is what the scanner holds once built (our index and work buffers are allocated
 // together); gpu_peak_mb is the most seen during one extra, untimed search, sampled every 0.1 ms.
 
+#include <cublas_v2.h>
 #include <omp.h>
 
 #include <algorithm>
@@ -175,6 +177,21 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
 
 }  // namespace
 
+// Loads cuBLAS (handle + one tiny GEMM) so its kernels and library state are in the memory
+// baseline, as they are for Faiss, whose GPU k-means runs before its baseline.
+void load_cublas() {
+    cublasHandle_t h;
+    if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasCreate failed");
+    float* m = nullptr;
+    CUDA_CHECK(cudaMalloc(&m, 3 * 32 * 32 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(m, 0, 3 * 32 * 32 * sizeof(float)));
+    const float one = 1.0f, zero = 0.0f;
+    cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, 32, 32, 32, &one, m, 32, m + 1024, 32, &zero, m + 2048, 32);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaFree(m));
+    cublasDestroy(h);
+}
+
 // Device memory in use on the whole GPU (MB); one job per GPU, so it is ours.
 double used_mb() {
     size_t free = 0, total = 0;
@@ -262,14 +279,8 @@ int main(int argc, char** argv) {
                              "check_queries,max_rel_err,scan_mismatch,rerank_mismatch,topc,codes_mb,gpu_index_mb,gpu_peak_mb");
         bool all_ok = true;
 
-        {  // throwaway warm-up: one-time library setup lands in the memory baseline, not in an index
-            IvfScanner warm(ix, static_cast<int>(bits_list[0]), batch, max_nprobe, max_C, budget, topc);
-            const int64_t wq = std::min<int64_t>(batch, nq);
-            std::vector<int32_t> wc(wq * max_C);
-            std::vector<float> we(wq * max_C);
-            warm.search(queries.data(), wq, max_nprobe, max_C, wc.data(), we.data());
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
+        load_cublas();
+        std::printf("device memory with CUDA and cuBLAS loaded: %.0f MB (the baseline)\n", used_mb());
 
         for (const int64_t bits : bits_list) {
             CUDA_CHECK(cudaDeviceSynchronize());

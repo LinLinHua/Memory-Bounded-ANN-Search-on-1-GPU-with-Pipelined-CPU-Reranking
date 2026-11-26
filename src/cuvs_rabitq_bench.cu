@@ -11,8 +11,9 @@
 //
 // Device memory comes from cudaMemGetInfo: gpu_index_mb is what the index holds after build,
 // gpu_peak_mb the most seen during one extra, untimed search (sampled every 0.1 ms), both
-// above a baseline taken after a throwaway warm-up (a small index built and searched once), so
-// cuVS's one-time setup is not counted in the first index. Run it with
+// above the baseline taken after the CUDA context and cuVS handle exist, so cuVS's workspace is
+// counted (--warmup 1 builds a throwaway index first; that keeps ~640 MB of workspace out of the
+// numbers, so it is for the ablation only). Run it with
 // CUDA_MODULE_LOADING=EAGER so the kernels' code is in that baseline, as for Faiss.
 //
 // Usage:
@@ -37,6 +38,7 @@
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_resources.hpp>
 #include <raft/core/host_mdspan.hpp>
+#include <raft/core/resource/cublas_handle.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
 
 #include "cli_utils.h"
@@ -136,6 +138,7 @@ int main(int argc, char** argv) {
         const auto nprobe_list = args.list("nprobe", "16,32,64");
         const auto c_list = args.list("C", "100,1000");
         const std::string mode_name = args.str("mode", "quant4");
+        const bool warmup = args.num("warmup", 0) != 0;  // 1: throwaway index before the baseline (hides ~640 MB of cuVS workspace; ablation only)
         const rq::search_mode mode = parse_mode(mode_name);
         args.reject_unknown();
 
@@ -153,8 +156,18 @@ int main(int argc, char** argv) {
         CUDA_OK(cudaFree(nullptr));
         raft::device_resources handle;
         auto stream = raft::resource::get_cuda_stream(handle);
+        {  // load cuBLAS (handle + one tiny GEMM) before the baseline, as in every benchmark
+            cublasHandle_t h = raft::resource::get_cublas_handle(handle);
+            float* m = nullptr;
+            CUDA_OK(cudaMalloc(&m, 3 * 32 * 32 * sizeof(float)));
+            CUDA_OK(cudaMemset(m, 0, 3 * 32 * 32 * sizeof(float)));
+            const float one = 1.0f, zero = 0.0f;
+            cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, 32, 32, 32, &one, m, 32, m + 1024, 32, &zero, m + 2048, 32);
+            CUDA_OK(cudaDeviceSynchronize());
+            CUDA_OK(cudaFree(m));
+        }
         const double context_mb = used_mb();
-        std::printf("device memory with the CUDA context and handle: %.0f MB\n", context_mb);
+        std::printf("device memory with the CUDA context, handle and cuBLAS: %.0f MB\n", context_mb);
 
         FILE* csv = open_csv(csv_path,
                              "algo,nlist,nprobe,C,nq,search_ms,qps,index_mb,build_s,recall10_no_rerank,"
@@ -167,7 +180,7 @@ int main(int argc, char** argv) {
         if (!transfer) raft::copy(queries_d.data_handle(), queries_pinned, nq * d, stream);
         raft::resource::sync_stream(handle);
 
-        {  // throwaway warm-up on the first 100,000 vectors: cuVS's one-time setup goes into the baseline
+        if (warmup) {  // throwaway warm-up on the first 100,000 vectors: cuVS's one-time setup goes into the baseline
             const int64_t wn = std::min<int64_t>(n, 100000), wq = std::min<int64_t>(nq, 128);
             rq::index_params wp;
             wp.n_lists = static_cast<uint32_t>(std::min<int64_t>(nlist, wn / 32));

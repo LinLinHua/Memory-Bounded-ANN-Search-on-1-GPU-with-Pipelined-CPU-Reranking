@@ -13,8 +13,8 @@ Timing follows docs/measurement.md: one warm-up, then the median of --reps searc
 queries, each starting from queries in pinned host memory and ending with ids and distances back
 on the host (--transfer 1, the default), in calls of --batch queries.
 codes_mb is n x bytes per vector. Device memory follows docs/measurement.md (cudaMemGetInfo,
-cupy pool emptied, above a baseline taken after a throwaway warm-up index is built and
-searched): gpu_index_mb is what the index holds after build, gpu_peak_mb the most seen during one
+cupy pool emptied, above the memory in use just before each index is built; the base vectors
+used only for building are already on the GPU then and are not counted): gpu_index_mb is what the index holds after build, gpu_peak_mb the most seen during one
 extra, untimed search, sampled every 0.1 ms from another thread.
 
   --batch B      queries per search call (0 = all at once, the default)
@@ -160,22 +160,14 @@ def main():
     n, d = base.shape
     print(f"base {n} x {d}, queries {len(queries)}, nlist {a.nlist}")
     base_gpu, queries_gpu = cp.asarray(base), cp.asarray(queries)
+    _ = cp.ones((32, 32), cp.float32) @ cp.ones((32, 32), cp.float32)  # load cuBLAS before the baseline
+    cp.cuda.Device().synchronize()
     queries_pinned = cupyx.empty_pinned(queries.shape, dtype=np.float32)
     queries_pinned[...] = queries
     search_queries = queries_pinned if a.transfer else queries_gpu
     print(f"batch {a.batch or 'all'}, transfer timed: {bool(a.transfer)}")
 
     pq_div = {"ivf_pq": 2, "ivf_pq_d4": 4, "ivf_pq_d8": 8}
-
-    # Throwaway warm-up: a small index built and searched once, so cuVS's one-time setup is in
-    # the memory baseline and not in the first index.
-    wn = min(n, 100_000)
-    warm = ivf_flat.build(ivf_flat.IndexParams(n_lists=max(1, min(a.nlist, wn // 32)), metric="sqeuclidean"),
-                          base_gpu[:wn])
-    ivf_flat.search(ivf_flat.SearchParams(n_probes=16), warm, queries_gpu[:128], 100)
-    cp.cuda.Device().synchronize()
-    del warm
-    gc.collect()
 
     rows = []
     for algo in a.algo.split(","):

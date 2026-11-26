@@ -49,10 +49,14 @@ the GPU before timing started and (cuvs_baseline only) the results stayed there.
   every CSV, for comparing index sizes.
 - Device memory, measured the same way in all four benchmarks with `cudaMemGetInfo` (whole
   GPU, so one job per GPU):
-  1. Warm-up: build a small throwaway index (first 100,000 vectors) and search it once, then free
-     it. The library's one-time setup (handles, streams, workspaces) is now in the baseline.
-  2. Baseline: device memory in use after the warm-up (and, for cuVS, after the base vectors
-     used only for building are on the GPU).
+  1. Baseline: device memory in use with the CUDA context, the library's handle and cuBLAS
+     loaded (one tiny GEMM; Faiss's GPU k-means does this before its baseline) and, for cuVS
+     IVF-Flat, the base vectors used only for building. cuBLAS alone is about 190 MB of kernels
+     and library state, the same for every method, so it is left out. Everything the library
+     allocates after that counts, its workspaces included.
+  2. No warm-up index before the baseline: a throwaway index leaves cuVS's workspace allocated
+     (about 640 MB for IVF-RaBitQ) and would hide it from every later number
+     (`scripts/ll_rabitq_warmup_a40.sbatch` measured this; speed was the same either way).
   3. `gpu_index_mb`: in use once the index is ready, minus the baseline. Ours allocates its work
      buffers with the index, so for ours this includes them.
   4. `gpu_peak_mb`: the highest reading during one extra, untimed search of all queries at the

@@ -10,5 +10,5 @@ mkdir -p "$(dirname "$OUT")"
     -Xcompiler "-fopenmp -march=native" \
     -I"$ENV/include/rapids" -I"$ENV/include" -I"$ENV/targets/x86_64-linux/include" -I"$PROJECT_DIR/src" \
     "$PROJECT_DIR/src/cuvs_rabitq_bench.cu" -o "$OUT" \
-    -L"$ENV/lib" -lcuvs -lrmm -lrapids_logger -lcudart -Xlinker -rpath="$ENV/lib"
+    -L"$ENV/lib" -lcuvs -lrmm -lrapids_logger -lcublas -lcudart -Xlinker -rpath="$ENV/lib"
 echo "built $OUT"
