@@ -17,6 +17,9 @@
 //
 // Usage:
 //   ivf_build --base B --out DIR [--nlist 1024] [--train 0] [--iters 20] [--seed 1234] [--max-base N]
+//             [--rotation random|none]
+//   --rotation none writes the identity as rotation.f32: 1-bit codes are the signs of the raw
+//   residuals (the ablation for the random rotation). Everything else is built the same way.
 //   --train 0 uses min(n, 256 * nlist) training points.
 
 #include <omp.h>
@@ -232,6 +235,9 @@ int main(int argc, char** argv) {
         const int iters = static_cast<int>(args.num("iters", 20));
         const uint32_t seed = static_cast<uint32_t>(args.num("seed", 1234));
         const int64_t max_base = args.num("max-base", -1);
+        const std::string rotation_mode = args.str("rotation", "random");
+        if (rotation_mode != "random" && rotation_mode != "none")
+            throw std::runtime_error("--rotation must be random or none");
         args.reject_unknown();
 
         const auto t_start = std::chrono::steady_clock::now();
@@ -310,7 +316,11 @@ int main(int argc, char** argv) {
             step8[j] = range / 255.0f;
             step4[j] = range / 15.0f;
         }
-        const auto rotation = random_rotation(d, rng);
+        auto rotation = random_rotation(d, rng);  // drawn either way, so the random stream is unchanged
+        if (rotation_mode == "none") {
+            std::fill(rotation.begin(), rotation.end(), 0.0f);
+            for (int64_t i = 0; i < d; i++) rotation[i * d + i] = 1.0f;
+        }
 
         std::vector<uint8_t> codes8(n * d), codes4(n * d / 2);
         std::vector<uint32_t> codes1(n * d / 32, 0);
@@ -366,7 +376,7 @@ int main(int argc, char** argv) {
         std::ofstream meta(out_dir + "/meta.json");
         meta << "{\n  \"n\": " << n << ",\n  \"d\": " << d << ",\n  \"nlist\": " << L
              << ",\n  \"seed\": " << seed << ",\n  \"train\": " << nt << ",\n  \"iters\": " << iters
-             << ",\n  \"builder\": \"ivf_build\"\n}\n";
+             << ",\n  \"rotation\": \"" << rotation_mode << "\",\n  \"builder\": \"ivf_build\"\n}\n";
 
         auto mb = [](size_t bytes) { return bytes / double(1 << 20); };
         std::printf("index sizes (MB): 8-bit %.0f, 4-bit %.0f, 1-bit %.0f (+norms %.0f), raw FP32 %.0f\n",
