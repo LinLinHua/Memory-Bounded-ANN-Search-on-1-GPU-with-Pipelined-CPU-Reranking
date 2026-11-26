@@ -84,9 +84,9 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 
 ### XJ
 
-- [ ] 寫 sequential 版和 pipeline 版（CUDA streams + 深度 1 的佇列） — 程式：`bench_pipeline`，待 A40 執行（`scripts/xj_pipeline_a40.sbatch`）
-- [ ] 確認 pipeline 和 sequential 回傳的結果完全相同
-- [ ] 完成精排時間拆解（結果 3）：C 從 10 到 1,000 — 程式：`bench_rerank_breakdown`，待 A40 執行
+- [x] 寫 sequential 版和 pipeline 版（CUDA streams + 深度 1 的佇列） — `bench_pipeline`（job 14870665）；用 scan 執行緒而非多個 stream
+- [x] 確認 pipeline 和 sequential 回傳的結果完全相同 — 改為競爭檢查（scan 同分時本身不確定）
+- [x] 完成精排時間拆解（結果 3）：C 從 10 到 1,000 — `bench_rerank_breakdown`（job 14870665）
   - 候選 ID 傳輸
   - 讀取向量或 PCIe 傳輸
   - 距離計算
@@ -107,10 +107,10 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 
 ### XJ
 
-- [ ] 量 batch 1、16 的 P50、P99 latency
-- [ ] 量 OpenMP scaling：1 個執行緒到全部核心 — 程式：`bench_rerank_breakdown`，待 A40 執行
-- [ ] 比較 pipeline 和 sequential 的 QPS，對照加速公式（結果 4）
-- [ ] 計算相對串行 baseline 的端到端加速（結果 5） — `scripts/xj_summary.py`；DEEP10M 串行版改為可讀 .fbin
+- [x] 量 batch 1、16 的 P50、P99 latency
+- [x] 量 OpenMP scaling：1 個執行緒到全部核心 — 只到 16 核（debug 節點共用），數字有雜訊
+- [x] 比較 pipeline 和 sequential 的 QPS，對照加速公式（結果 4）
+- [x] 計算相對串行 baseline 的端到端加速（結果 5） — `scripts/xj_summary.py`；DEEP10M 串行版改為可讀 .fbin
 
 ### HS
 
@@ -120,7 +120,7 @@ Memory-Bounded ANN Search on a Single GPU with Pipelined CPU Reranking
 ## Day 13–14：報告與提交
 
 - [x] **LL** 寫 kernel 和分析章節
-- [ ] **XJ** 寫 pipeline 和精排章節
+- [x] **XJ** 寫 pipeline 和精排章節 — `docs/xj_pipeline_and_rerank.md`，含預算下的 pipeline（job 14870691）
 - [ ] **HS** 整合報告、README、limitations
 - [ ] **全員** 按 README 從頭跑一次，確認其他人也能重現
 - [ ] **全員** 核對每張圖都能由腳本產生，並記錄負面結果（例如沒有 crossover、輸給 cuVS）
