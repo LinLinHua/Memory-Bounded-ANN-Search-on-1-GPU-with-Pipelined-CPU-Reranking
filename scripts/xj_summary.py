@@ -77,6 +77,26 @@ def result4(res):
            "scan_ms", "rerank_ms", "seq_p50", "seq_p99", "pipe_p50", "pipe_p99", "race", "tie_diff"], out)
 
 
+def result_budget(res):
+    rows = read(os.path.join(res, "xj_pipeline_budget.csv"), ("label", "bits", "topc", "C", "batch", "mode"))
+    if not rows:
+        return
+    print("Pipeline under the GPU memory budget (label = dataset@fraction of the raw FP32 data)")
+    out = []
+    keys = sorted({k[:5] for k in rows}, key=lambda k: (k[0], int(k[1]), int(k[4])))
+    for k in keys:
+        over = rows.get(k + ("over_budget",))
+        s, p = rows.get(k + ("sequential",)), rows.get(k + ("pipelined",))
+        if over and not s:
+            out.append([k[0], k[1], k[2], k[3], k[4], over["budget_mb"], "over", "-", "-", "-", "-", "-", "-"])
+        elif s and p:
+            out.append([k[0], k[1], k[2], k[3], k[4], s["budget_mb"], "fits", f(s["index_mb"], 1),
+                        f(s["work_mb"], 1), f(s["measured_peak_mb"], 1), f(s["recall10"], 4), f(s["qps"], 0),
+                        f(p["qps"], 0)])
+    table(["data", "bits", "topc", "C", "batch", "budget_MiB", "status", "index_MiB", "work_MiB",
+           "measured_MiB", "R@10", "seq_qps", "pipe_qps"], out)
+
+
 def result5(res):
     rows = read(os.path.join(res, "xj_rerank_scaling.csv"), ("label", "C", "prefetch", "threads"))
     if rows:
@@ -109,6 +129,7 @@ def main():
     res = ap.parse_args().results
     result3(res)
     result4(res)
+    result_budget(res)
     result5(res)
 
 

@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <thread>
@@ -283,7 +284,6 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
         CUDA_CHECK(cudaSetDevice(0));
         CUDA_CHECK(cudaFree(nullptr));
-        DeviceBudget budget(static_cast<size_t>(budget_mb) << 20);
 
         FILE* csv = open_csv(csv_path,
                              "label,bits,topc,nprobe,C,batch,nq,threads,prefetch,mode,total_ms,qps,scan_ms,"
@@ -292,7 +292,27 @@ int main(int argc, char** argv) {
         bool all_ok = true;
 
         for (const int64_t batch : batch_list) {
-            IvfScanner scanner(ix, bits, static_cast<int>(batch), nprobe, C, budget, topc);
+            // A fresh budget per batch size: the peak is per setting, and a scanner whose buffers do
+            // not fit leaves nothing behind (the budget frees what it allocated).
+            DeviceBudget budget(static_cast<size_t>(budget_mb) << 20);
+            std::unique_ptr<IvfScanner> scanner_ptr;
+            try {
+                scanner_ptr = std::make_unique<IvfScanner>(ix, bits, static_cast<int>(batch), nprobe, C, budget, topc);
+            } catch (const std::runtime_error& e) {
+                if (std::string(e.what()).rfind("budget exceeded", 0) != 0) throw;
+                std::printf("\n=== batch %lld  OVER BUDGET (%lld MB): %s\n", (long long)batch,
+                            (long long)budget_mb, e.what());
+                if (csv) {
+                    std::fprintf(csv, "%s,%d,%s,%d,%d,%lld,%lld,%d,%d,over_budget,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
+                                      "%lld,%.2f,%.2f\n",
+                                 label.c_str(), bits, topc_name.c_str(), nprobe, C, (long long)batch,
+                                 (long long)nq, threads, prefetch, (long long)budget_mb,
+                                 budget.peak() / double(1 << 20), budget.measured_peak() / double(1 << 20));
+                    std::fflush(csv);
+                }
+                continue;
+            }
+            IvfScanner& scanner = *scanner_ptr;
             const double index_mb = scanner.index_bytes() / double(1 << 20);
             const double work_mb = scanner.work_bytes() / double(1 << 20);
             const Workload w{base.data(), queries.data(), d, nq, nprobe, C, static_cast<int>(batch), prefetch};
@@ -336,10 +356,10 @@ int main(int argc, char** argv) {
             }
             std::printf("speedup measured %.3f  predicted %.3f\n", speedup, predicted);
             if (csv) std::fflush(csv);
+            budget.report(stdout);
         }
 
         std::printf("\n");
-        budget.report(stdout);
         std::printf("%s\n", all_ok ? "PIPELINE RACE CHECK PASSED" : "PIPELINE RACE CHECK FAILED");
         if (csv) std::fclose(csv);
         return all_ok ? 0 : 2;
