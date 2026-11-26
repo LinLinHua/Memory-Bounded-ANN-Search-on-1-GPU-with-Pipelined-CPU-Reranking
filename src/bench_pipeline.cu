@@ -8,7 +8,12 @@
 // For every micro-batch size it reports throughput, the per-batch latency (P50, P99), the measured
 // pipeline speedup and the one the formula predicts from the sequential stage times:
 //   predicted = (T_scan + T_rerank) / max(T_scan, T_rerank)
-// and checks that both modes return bit-identical results.
+// and checks the pipeline for races: one extra pipelined run keeps the candidates it reranked, and a
+// plain rerank of those candidates afterwards must give bit-identical results.
+//
+// Sequential and pipelined runs can still differ slightly, because the scan itself is not
+// deterministic: when several estimates tie at the C-th place, which of them are kept depends on the
+// order of atomic updates. That difference is reported (seq_pipe_diff) but is not an error.
 //
 // Latency is the time from the start of a batch's scan to the end of its rerank, with every query
 // available at the start. It is the per-batch service time, not a latency under an arrival process.
@@ -118,7 +123,8 @@ RunResult run_sequential(IvfScanner& scanner, const Workload& w) {
 
 // The scan thread fills slot b % 2 with the candidates of batch b; the calling thread (and its
 // OpenMP team) reranks it and hands the slot back.
-RunResult run_pipelined(IvfScanner& scanner, const Workload& w) {
+// keep, when given, receives the candidates of every batch as the rerank used them (nq x C).
+RunResult run_pipelined(IvfScanner& scanner, const Workload& w, std::vector<int32_t>* keep = nullptr) {
     RunResult r;
     r.ids.resize(w.nq * kRecallK);
     r.dists.resize(w.nq * kRecallK);
@@ -181,6 +187,7 @@ RunResult run_pipelined(IvfScanner& scanner, const Workload& w) {
                    r.dists.data() + q0 * kRecallK);
         rerank_end[b] = Clock::now();
         r.rerank_ms += ms_between(a, rerank_end[b]);
+        if (keep) std::copy_n(cand[s].data(), nqb * w.C, keep->data() + q0 * w.C);
         {
             std::lock_guard<std::mutex> lock(mu);
             full[s] = false;
@@ -198,12 +205,23 @@ RunResult run_pipelined(IvfScanner& scanner, const Workload& w) {
     return r;
 }
 
-// Bit-identical IDs and distances; both modes run the same scan and rerank code.
-int64_t count_mismatch(const RunResult& a, const RunResult& b) {
+// Entries whose ID or distance bits differ.
+int64_t count_diff(const std::vector<int32_t>& ids_a, const std::vector<float>& dists_a,
+                   const std::vector<int32_t>& ids_b, const std::vector<float>& dists_b) {
     int64_t bad = 0;
-    for (size_t i = 0; i < a.ids.size(); i++)
-        if (a.ids[i] != b.ids[i] || std::memcmp(&a.dists[i], &b.dists[i], sizeof(float)) != 0) bad++;
+    for (size_t i = 0; i < ids_a.size(); i++)
+        if (ids_a[i] != ids_b[i] || std::memcmp(&dists_a[i], &dists_b[i], sizeof(float)) != 0) bad++;
     return bad;
+}
+
+// Race check: rerank the candidates a pipelined run used, after the fact, and compare.
+int64_t pipeline_race_check(IvfScanner& scanner, const Workload& w) {
+    std::vector<int32_t> cand(w.nq * w.C);
+    const RunResult pipe = run_pipelined(scanner, w, &cand);
+    std::vector<int32_t> ids(w.nq * kRecallK);
+    std::vector<float> dists(w.nq * kRecallK);
+    cpu_rerank(rerank_args(w, 0, w.nq, cand.data()), ids.data(), dists.data());
+    return count_diff(pipe.ids, pipe.dists, ids, dists);
 }
 
 // Runs one mode reps + 1 times (the first is warm-up) and keeps the run with the median total.
@@ -270,7 +288,7 @@ int main(int argc, char** argv) {
         FILE* csv = open_csv(csv_path,
                              "label,bits,topc,nprobe,C,batch,nq,threads,prefetch,mode,total_ms,qps,scan_ms,"
                              "rerank_ms,predicted_speedup,speedup,lat_p50_ms,lat_p99_ms,lat_mean_ms,recall10,"
-                             "mismatch,index_mb,work_mb,budget_mb,peak_mb,measured_peak_mb");
+                             "mismatch,seq_pipe_diff,index_mb,work_mb,budget_mb,peak_mb,measured_peak_mb");
         bool all_ok = true;
 
         for (const int64_t batch : batch_list) {
@@ -281,15 +299,19 @@ int main(int argc, char** argv) {
 
             const RunResult seq = median_run([&] { return run_sequential(scanner, w); }, reps);
             const RunResult pipe = median_run([&] { return run_pipelined(scanner, w); }, reps);
-            const int64_t mismatch = count_mismatch(seq, pipe);
+            const int64_t mismatch = pipeline_race_check(scanner, w);
+            const int64_t seq_pipe_diff = count_diff(seq.ids, seq.dists, pipe.ids, pipe.dists);
             all_ok = all_ok && mismatch == 0;
 
             const double predicted = (seq.scan_ms + seq.rerank_ms) / std::max(seq.scan_ms, seq.rerank_ms);
             const double speedup = seq.total_ms / pipe.total_ms;
             const double recall = recall_at_10(seq.ids.data(), gt.data(), kgt, nq);
+            const double recall_pipe = recall_at_10(pipe.ids.data(), gt.data(), kgt, nq);
 
-            std::printf("\n=== batch %lld  index %.1f MB  work %.1f MB  recall@10 %.4f  mismatch %lld\n",
-                        (long long)batch, index_mb, work_mb, recall, (long long)mismatch);
+            std::printf("\n=== batch %lld  index %.1f MB  work %.1f MB  recall@10 %.4f / %.4f  "
+                        "pipeline mismatch %lld  seq-vs-pipe diff %lld (scan ties)\n",
+                        (long long)batch, index_mb, work_mb, recall, recall_pipe, (long long)mismatch,
+                        (long long)seq_pipe_diff);
             for (const auto* run : {&seq, &pipe}) {
                 const bool is_seq = run == &seq;
                 const double mean =
@@ -302,12 +324,13 @@ int main(int argc, char** argv) {
                 if (csv)
                     std::fprintf(csv,
                                  "%s,%d,%s,%d,%d,%lld,%lld,%d,%d,%s,%.3f,%.1f,%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,"
-                                 "%.4f,%.5f,%lld,%.2f,%.2f,%lld,%.2f,%.2f\n",
+                                 "%.4f,%.5f,%lld,%lld,%.2f,%.2f,%lld,%.2f,%.2f\n",
                                  label.c_str(), bits, topc_name.c_str(), nprobe, C, (long long)batch,
                                  (long long)nq, threads, prefetch, is_seq ? "sequential" : "pipelined",
                                  run->total_ms, nq / (run->total_ms / 1e3), run->scan_ms, run->rerank_ms,
                                  predicted, is_seq ? 1.0 : speedup, percentile(run->latency, 0.5),
-                                 percentile(run->latency, 0.99), mean, recall, (long long)mismatch, index_mb,
+                                 percentile(run->latency, 0.99), mean, is_seq ? recall : recall_pipe,
+                                 (long long)mismatch, (long long)seq_pipe_diff, index_mb,
                                  work_mb, (long long)budget_mb, budget.peak() / double(1 << 20),
                                  budget.measured_peak() / double(1 << 20));
             }
@@ -317,7 +340,7 @@ int main(int argc, char** argv) {
 
         std::printf("\n");
         budget.report(stdout);
-        std::printf("%s\n", all_ok ? "PIPELINE MATCHES SEQUENTIAL" : "PIPELINE RESULTS DIFFER");
+        std::printf("%s\n", all_ok ? "PIPELINE RACE CHECK PASSED" : "PIPELINE RACE CHECK FAILED");
         if (csv) std::fclose(csv);
         return all_ok ? 0 : 2;
     } catch (const std::exception& e) {

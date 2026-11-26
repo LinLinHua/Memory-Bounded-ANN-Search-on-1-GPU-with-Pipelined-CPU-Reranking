@@ -35,6 +35,11 @@ def f(x, digits=2):
     return f"{float(x):.{digits}f}"
 
 
+def bw(part_ms, total_ms, gbs):
+    """Bandwidth from a time found by subtraction; too noisy when the part is under 20% of the total."""
+    return f(gbs, 1) if float(part_ms) >= 0.2 * float(total_ms) else "-"
+
+
 def result3(res):
     rows = read(os.path.join(res, "xj_rerank_breakdown.csv"), ("label", "bits", "C"))
     if not rows:
@@ -47,7 +52,8 @@ def result3(res):
         out.append([label, bits, C, f(r["recall10"], 4), f(r["cpu_id_d2h_ms"], 3), f(r["cpu_gather_ms"]),
                     f(r["cpu_compute_ms"]), f(cpu), f(r["gpu_pcie_ms"]), f(r["gpu_compute_ms"]),
                     f(r["gpu_result_d2h_ms"], 3), f(gpu), "CPU" if cpu < gpu else "GPU",
-                    f(r["cpu_gather_gbs"], 1), f(r["gpu_pcie_gbs"], 1), r["rank_mismatch"]])
+                    bw(r["cpu_gather_ms"], r["cpu_rerank_ms"], r["cpu_gather_gbs"]),
+                    bw(r["gpu_pcie_ms"], r["gpu_kernel_ms"], r["gpu_pcie_gbs"]), r["rank_mismatch"]])
     table(["data", "bits", "C", "R@10", "cpu_ids", "gather", "compute", "CPU", "pcie", "compute", "results",
            "GPU", "faster", "gather_GB/s", "pcie_GB/s", "mismatch"], out)
 
@@ -66,9 +72,9 @@ def result4(res):
         out.append([k[0], k[1], k[2], k[3], k[4], f(s["recall10"], 4), f(s["qps"], 0), f(p["qps"], 0),
                     f(p["speedup"]), f(p["predicted_speedup"]), f(s["scan_ms"], 1), f(s["rerank_ms"], 1),
                     f(s["lat_p50_ms"], 3), f(s["lat_p99_ms"], 3), f(p["lat_p50_ms"], 3), f(p["lat_p99_ms"], 3),
-                    p["mismatch"]])
+                    p["mismatch"], p.get("seq_pipe_diff", "")])
     table(["data", "bits", "topc", "C", "batch", "R@10", "seq_qps", "pipe_qps", "speedup", "predicted",
-           "scan_ms", "rerank_ms", "seq_p50", "seq_p99", "pipe_p50", "pipe_p99", "mismatch"], out)
+           "scan_ms", "rerank_ms", "seq_p50", "seq_p99", "pipe_p50", "pipe_p99", "race", "tie_diff"], out)
 
 
 def result5(res):
