@@ -22,7 +22,9 @@ process. Within one process the CPU and GPU versions of an encoding hold the sam
 GPU index is a copy of the CPU one).
 
 GPU memory follows the proposal: no Faiss temporary-memory pool (--temp-mb 0), and memory is
-reported above the CUDA context. gpu_index_mb is the device memory held after the index is
+reported above a baseline taken after a throwaway warm-up (a small GPU IVF-Flat index built and
+searched once), so Faiss's one-time setup is not counted in the first index
+(docs/measurement.md). gpu_index_mb is the device memory held after the index is
 on the GPU (codes, IDs, centroids, Faiss's handles); gpu_peak_mb is the most seen during one
 extra, untimed search, sampled with cudaMemGetInfo every 0.1 ms, so very short spikes can be
 missed. Run with CUDA_MODULE_LOADING=EAGER (scripts/faiss_baseline_a40.sbatch does): then the
@@ -250,8 +252,18 @@ def main():
             res.setTempMemory(a.temp_mb * MB)
         else:
             res.noTempMemory()
+        # Throwaway warm-up: Faiss's per-device setup (handles, streams) goes into the baseline.
+        wn = min(n, 100_000)
+        wq = faiss.IndexFlatL2(d)
+        warm = faiss.IndexIVFFlat(wq, d, max(1, min(a.nlist, wn // 32)))
+        warm.train(base[:wn])
+        warm.add(base[:wn])
+        warm_gpu = faiss.index_cpu_to_gpu(res, 0, warm)
+        warm_gpu.search(queries[:128], 100)
+        del warm_gpu, warm, wq
+        gc.collect()
         context_mb = mem.used_mb()
-        print(f"device memory with the CUDA context only: {context_mb:.0f} MB (subtracted below)")
+        print(f"device memory after the warm-up: {context_mb:.0f} MB (the baseline subtracted below)")
 
     cpu_indexes, build_times = {}, {}
     for algo in algos:

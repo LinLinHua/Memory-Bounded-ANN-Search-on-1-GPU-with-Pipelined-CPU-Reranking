@@ -47,9 +47,19 @@ the GPU before timing started and (cuvs_baseline only) the results stayed there.
   rerank and the baselines' NumPy rerank return the same neighbors up to distance ties.
 - `codes_mb`: n × bytes per vector of codes only (n·d·bits/8). The same definition in
   every CSV, for comparing index sizes.
-- Device memory actually held: ours from `DeviceBudget` (`index_mb` + `work_mb`, every allocation
-  of the scan); baselines from `cudaMemGetInfo` (`gpu_index_mb`, Faiss and RaBitQ also
-  `gpu_peak_mb`). Run with `CUDA_MODULE_LOADING=EAGER` so kernel code is not counted.
+- Device memory, measured the same way in all four benchmarks with `cudaMemGetInfo` (whole
+  GPU, so one job per GPU):
+  1. Warm-up: build a small throwaway index (first 100,000 vectors) and search it once, then free
+     it. The library's one-time setup (handles, streams, workspaces) is now in the baseline.
+  2. Baseline: device memory in use after the warm-up (and, for cuVS, after the base vectors
+     used only for building are on the GPU).
+  3. `gpu_index_mb`: in use once the index is ready, minus the baseline. Ours allocates its work
+     buffers with the index, so for ours this includes them.
+  4. `gpu_peak_mb`: the highest reading during one extra, untimed search of all queries at the
+     benchmark's batch size, sampled every 0.1 ms from another thread, minus the baseline.
+     This is the number to compare: everything the GPU must hold to answer the queries.
+  Run with `CUDA_MODULE_LOADING=EAGER` so kernel code is in the baseline. Ours also reports
+  `index_mb` and `work_mb` from `DeviceBudget`, which counts each of our allocations exactly.
 
 ## What still differs
 

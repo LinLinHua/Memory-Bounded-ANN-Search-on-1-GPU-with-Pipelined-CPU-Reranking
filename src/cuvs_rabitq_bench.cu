@@ -11,7 +11,8 @@
 //
 // Device memory comes from cudaMemGetInfo: gpu_index_mb is what the index holds after build,
 // gpu_peak_mb the most seen during one extra, untimed search (sampled every 0.1 ms), both
-// above the baseline taken after the CUDA context and cuVS handle exist. Run it with
+// above a baseline taken after a throwaway warm-up (a small index built and searched once), so
+// cuVS's one-time setup is not counted in the first index. Run it with
 // CUDA_MODULE_LOADING=EAGER so the kernels' code is in that baseline, as for Faiss.
 //
 // Usage:
@@ -153,7 +154,7 @@ int main(int argc, char** argv) {
         raft::device_resources handle;
         auto stream = raft::resource::get_cuda_stream(handle);
         const double context_mb = used_mb();
-        std::printf("device memory with the CUDA context and handle: %.0f MB (subtracted below)\n", context_mb);
+        std::printf("device memory with the CUDA context and handle: %.0f MB\n", context_mb);
 
         FILE* csv = open_csv(csv_path,
                              "algo,nlist,nprobe,C,nq,search_ms,qps,index_mb,build_s,recall10_no_rerank,"
@@ -166,18 +167,38 @@ int main(int argc, char** argv) {
         if (!transfer) raft::copy(queries_d.data_handle(), queries_pinned, nq * d, stream);
         raft::resource::sync_stream(handle);
 
+        {  // throwaway warm-up on the first 100,000 vectors: cuVS's one-time setup goes into the baseline
+            const int64_t wn = std::min<int64_t>(n, 100000), wq = std::min<int64_t>(nq, 128);
+            rq::index_params wp;
+            wp.n_lists = static_cast<uint32_t>(std::min<int64_t>(nlist, wn / 32));
+            wp.bits_per_dim = static_cast<uint32_t>(bits_list[0]);
+            auto warm = rq::build(handle, wp, raft::make_host_matrix_view<const float, int64_t>(base.data(), wn, d));
+            rq::search_params sp;
+            sp.n_probes = 16;
+            sp.mode = mode;
+            auto wn_d = raft::make_device_matrix<int64_t, int64_t>(handle, wq, 100);
+            auto wd_d = raft::make_device_matrix<float, int64_t>(handle, wq, 100);
+            raft::copy(queries_d.data_handle(), queries_pinned, wq * d, stream);
+            rq::search(handle, sp, warm,
+                       raft::make_device_matrix_view<const float, int64_t>(queries_d.data_handle(), wq, d),
+                       wn_d.view(), wd_d.view());
+            raft::resource::sync_stream(handle);
+        }
+        CUDA_OK(cudaDeviceSynchronize());
+        const double base_mb = used_mb();
+        std::printf("device memory after the warm-up: %.0f MB (the baseline subtracted below)\n", base_mb);
+
         for (int64_t bits : bits_list) {
             rq::index_params ip;
             ip.n_lists = static_cast<uint32_t>(nlist);
             ip.bits_per_dim = static_cast<uint32_t>(bits);
-            const double before = used_mb();
             const auto t0 = Clock::now();
             // From host memory: no full-precision copy of the dataset stays on the GPU.
             auto index = rq::build(handle, ip,
                                    raft::make_host_matrix_view<const float, int64_t>(base.data(), n, d));
             raft::resource::sync_stream(handle);
             const double build_s = std::chrono::duration<double>(Clock::now() - t0).count();
-            const double gpu_index_mb = used_mb() - before;
+            const double gpu_index_mb = used_mb() - base_mb;
             const double index_mb = n * d * bits / 8.0 / kMB;
             const std::string algo = "ivf_rabitq_b" + std::to_string(bits);
             std::printf("=== %s: build %.1f s, codes %.0f MB, on GPU %.1f MB\n", algo.c_str(), build_s,
@@ -214,7 +235,7 @@ int main(int argc, char** argv) {
                     }
                     const double ms = median(times);
                     // Index, queries and output buffers are all on the device during the search.
-                    const double peak_mb = peak_during(search_all) - context_mb;
+                    const double peak_mb = peak_during(search_all) - base_mb;
                     const double no_rerank = recall_at_10(cand, C, gt, kgt, nq);
                     const double reranked = recall_at_10(exact_rerank(base, queries, d, cand, C, nq), 10, gt, kgt, nq);
                     const double qps = nq / (ms / 1e3);

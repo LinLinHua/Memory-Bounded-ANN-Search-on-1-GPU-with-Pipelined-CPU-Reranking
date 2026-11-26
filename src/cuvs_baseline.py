@@ -12,8 +12,10 @@ computed after the same exact rerank (NumPy, not timed), so the numbers line up 
 Timing follows docs/measurement.md: one warm-up, then the median of --reps searches of all
 queries, each starting from queries in pinned host memory and ending with ids and distances back
 on the host (--transfer 1, the default), in calls of --batch queries.
-codes_mb is n x bytes per vector; gpu_index_mb is device memory the index holds after build
-(cudaMemGetInfo, cupy pool emptied).
+codes_mb is n x bytes per vector. Device memory follows docs/measurement.md (cudaMemGetInfo,
+cupy pool emptied, above a baseline taken after a throwaway warm-up index is built and
+searched): gpu_index_mb is what the index holds after build, gpu_peak_mb the most seen during one
+extra, untimed search, sampled every 0.1 ms from another thread.
 
   --batch B      queries per search call (0 = all at once, the default)
   --transfer 0   queries already on the GPU and results left there (the timing before Nov 25)
@@ -25,8 +27,10 @@ Usage:
 """
 import argparse
 import csv
+import ctypes
 import gc
 import os
+import threading
 import time
 
 import cupy as cp
@@ -81,6 +85,39 @@ def used_mb():
     return (total - free) / 2**20
 
 
+_cudart = None
+
+
+def peak_used_mb(fn):
+    """Runs fn() while another thread samples device memory every 0.1 ms; returns the highest
+    reading (MB) and the number of samples. The sampler calls cudaMemGetInfo through ctypes,
+    which releases the GIL, and cuVS releases it during search."""
+    global _cudart
+    if _cudart is None:
+        _cudart = ctypes.CDLL("libcudart.so.12")
+    def read():
+        free, total = ctypes.c_size_t(), ctypes.c_size_t()
+        _cudart.cudaMemGetInfo(ctypes.byref(free), ctypes.byref(total))
+        return (total.value - free.value) / 2**20
+    peak, count, done = [read()], [0], threading.Event()
+
+    def sample():
+        while not done.is_set():
+            peak[0] = max(peak[0], read())
+            count[0] += 1
+            time.sleep(1e-4)
+
+    t = threading.Thread(target=sample)
+    t.start()
+    try:
+        fn()
+        cp.cuda.Device().synchronize()
+    finally:
+        done.set()
+        t.join()
+    return max(peak[0], read()), count[0]
+
+
 def batched_search(module, params, index, queries, C, batch, transfer):
     """Searches `queries` in calls of `batch` queries (0 = one call). With transfer, `queries` is
     pinned host memory: each batch is uploaded, searched, and its results are downloaded."""
@@ -129,6 +166,17 @@ def main():
     print(f"batch {a.batch or 'all'}, transfer timed: {bool(a.transfer)}")
 
     pq_div = {"ivf_pq": 2, "ivf_pq_d4": 4, "ivf_pq_d8": 8}
+
+    # Throwaway warm-up: a small index built and searched once, so cuVS's one-time setup is in
+    # the memory baseline and not in the first index.
+    wn = min(n, 100_000)
+    warm = ivf_flat.build(ivf_flat.IndexParams(n_lists=max(1, min(a.nlist, wn // 32)), metric="sqeuclidean"),
+                          base_gpu[:wn])
+    ivf_flat.search(ivf_flat.SearchParams(n_probes=16), warm, queries_gpu[:128], 100)
+    cp.cuda.Device().synchronize()
+    del warm
+    gc.collect()
+
     rows = []
     for algo in a.algo.split(","):
         if algo not in pq_div and algo != "ivf_flat":
@@ -157,17 +205,23 @@ def main():
                 params = module.SearchParams(n_probes=nprobe)
                 (dist, ids), ms = timed_search(
                     lambda: batched_search(module, params, index, search_queries, C, a.batch, a.transfer), a.reps)
+                cp.get_default_memory_pool().free_all_blocks()
+                peak, samples = peak_used_mb(
+                    lambda: batched_search(module, params, index, search_queries, C, a.batch, a.transfer))
+                gpu_peak_mb = peak - before
                 cand = cp.asnumpy(cp.asarray(ids)).astype(np.int64)
                 no_rerank = recall_at_10(cand, gt)
                 reranked = recall_at_10(exact_rerank(base, queries, cand), gt)
                 qps = len(queries) / (ms / 1e3)
                 print(f"nprobe={nprobe:<3d} C={C:<4d} search_ms={ms:7.1f} qps={qps:8.0f}  "
-                      f"R@10 no_rerank={no_rerank:.4f} rerank={reranked:.4f}")
+                      f"R@10 no_rerank={no_rerank:.4f} rerank={reranked:.4f}  "
+                      f"peak {gpu_peak_mb:.0f} MB ({samples} samples)")
                 rows.append(dict(algo=algo, nlist=a.nlist, nprobe=nprobe, C=C, nq=len(queries),
                                  search_ms=round(ms, 3), qps=round(qps, 1), index_mb=round(index_mb, 1),
                                  build_s=round(build_s, 2), recall10_no_rerank=round(no_rerank, 5),
                                  recall10_rerank=round(reranked, 5), batch=a.batch, transfer=a.transfer,
-                                 codes_mb=round(index_mb, 1), gpu_index_mb=round(gpu_index_mb, 1)))
+                                 codes_mb=round(index_mb, 1), gpu_index_mb=round(gpu_index_mb, 1),
+                                 gpu_peak_mb=round(gpu_peak_mb, 1)))
         del index  # release it before the next index's memory baseline
         gc.collect()
 
