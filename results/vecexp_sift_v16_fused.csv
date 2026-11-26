@@ -1,0 +1,3 @@
+bits,nprobe,C,nq,batch,index_mb,work_mb,scan_ms,qps,coarse_ms,scan_kernel_ms,select_ms,cand_recall,recall10_no_rerank,recall10_rerank,cpu_rerank_ms,check_queries,max_rel_err,scan_mismatch,rerank_mismatch,topc
+8,64,100,10000,256,126.40,13.95,270.021,37034.2,5.919,257.611,5.101,0.99610,0.98096,0.99538,12.426,50,4.047e-07,0,0,fused
+4,64,100,10000,256,65.36,13.95,117.572,85054.0,5.831,105.354,5.076,0.99608,0.79138,0.99541,12.808,50,7.996e-07,0,0,fused
