@@ -1,8 +1,10 @@
 // cuVS IVF-RaBitQ baseline (HS). cuVS has no Python binding for it yet, so this is C++.
 //
 // Same job and CSV columns as src/cuvs_baseline.py: return C candidates per query, then recall
-// after an exact rerank on the CPU (not timed). The timed search includes copying the
-// candidates to the host, because the rerank needs them there.
+// after an exact rerank on the CPU (not timed). Timing follows docs/measurement.md: each timed
+// search starts from the queries in pinned host memory, uploads each batch, and copies the
+// candidates back to the host (--transfer 1, the default). --transfer 0 keeps the queries on
+// the GPU before timing starts (the timing before Nov 25).
 //
 //   bits_per_dim 1      1 bit per dimension (binary RaBitQ, like our 1-bit codes)
 //   bits_per_dim 2..9   extended RaBitQ with more bits per dimension (4 = our 4-bit size)
@@ -14,7 +16,7 @@
 //
 // Usage:
 //   cuvs_rabitq_bench --base B --query Q --gt G --nlist 1024 [--bits 1,2,3,4]
-//                     [--nprobe 16,32,64] [--C 100,1000] [--batch 0] [--reps 5]
+//                     [--nprobe 16,32,64] [--C 100,1000] [--batch 0] [--reps 5] [--transfer 1]
 //                     [--mode quant4|quant8|lut16|lut32] [--csv results/cuvs_rabitq_sift.csv]
 
 #include <cuda_runtime.h>
@@ -128,6 +130,7 @@ int main(int argc, char** argv) {
         const std::string gt_path = args.required("gt"), csv_path = args.str("csv");
         const int64_t nlist = args.num("nlist", 1024), batch_arg = args.num("batch", 0);
         const int reps = static_cast<int>(args.num("reps", 5));
+        const bool transfer = args.num("transfer", 1) != 0;
         const auto bits_list = args.list("bits", "1,2,3,4");
         const auto nprobe_list = args.list("nprobe", "16,32,64");
         const auto c_list = args.list("C", "100,1000");
@@ -157,7 +160,10 @@ int main(int argc, char** argv) {
                              "recall10_rerank,batch,gpu_index_mb,gpu_peak_mb,rerank_timed,bits_per_dim,mode,cuvs");
 
         auto queries_d = raft::make_device_matrix<float, int64_t>(handle, nq, d);
-        raft::copy(queries_d.data_handle(), queries.data(), nq * d, stream);
+        float* queries_pinned = nullptr;  // where each timed search starts when transfer is on
+        CUDA_OK(cudaMallocHost(&queries_pinned, nq * d * sizeof(float)));
+        std::copy(queries.begin(), queries.end(), queries_pinned);
+        if (!transfer) raft::copy(queries_d.data_handle(), queries_pinned, nq * d, stream);
         raft::resource::sync_stream(handle);
 
         for (int64_t bits : bits_list) {
@@ -188,6 +194,8 @@ int main(int argc, char** argv) {
                     auto search_all = [&] {
                         for (int64_t off = 0; off < nq; off += batch) {
                             const int64_t b = std::min(batch, nq - off);
+                            if (transfer)
+                                raft::copy(queries_d.data_handle() + off * d, queries_pinned + off * d, b * d, stream);
                             rq::search(handle, sp, index,
                                        raft::make_device_matrix_view<const float, int64_t>(
                                            queries_d.data_handle() + off * d, b, d),
@@ -225,6 +233,7 @@ int main(int argc, char** argv) {
             }
         }
         if (csv) std::fclose(csv);
+        cudaFreeHost(queries_pinned);
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());

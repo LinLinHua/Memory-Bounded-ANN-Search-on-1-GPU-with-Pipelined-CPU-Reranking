@@ -226,13 +226,15 @@ int main(int argc, char** argv) {
         FILE* csv = open_csv(csv_path,
                              "bits,nprobe,C,nq,batch,index_mb,work_mb,scan_ms,qps,coarse_ms,scan_kernel_ms,"
                              "select_ms,cand_recall,recall10_no_rerank,recall10_rerank,cpu_rerank_ms,"
-                             "check_queries,max_rel_err,scan_mismatch,rerank_mismatch,topc");
+                             "check_queries,max_rel_err,scan_mismatch,rerank_mismatch,topc,codes_mb");
         bool all_ok = true;
 
         for (const int64_t bits : bits_list) {
             IvfScanner scanner(ix, static_cast<int>(bits), batch, max_nprobe, max_C, budget, topc);
             const double index_mb = scanner.index_bytes() / double(1 << 20);
             const double work_mb = scanner.work_bytes() / double(1 << 20);
+            // Codes only (n x d x bits / 8), the same definition as the baselines' codes_mb / index_mb.
+            const double codes_mb = double(n) * d * bits / 8.0 / double(1 << 20);
             std::printf("\n=== %lld-bit  top-C %s  index %.1f MB  work buffers %.1f MB\n", (long long)bits, topc_name.c_str(), index_mb, work_mb);
 
             for (const int64_t nprobe : nprobe_list) {
@@ -293,12 +295,12 @@ int main(int argc, char** argv) {
                                 parts.scan, parts.select, cand_recall, no_rerank, reranked, median(rerank_times),
                                 chk.max_rel, (long long)chk.mismatch, (long long)rerank_mismatch);
                     if (csv)
-                        std::fprintf(csv, "%lld,%lld,%lld,%lld,%d,%.2f,%.2f,%.3f,%.1f,%.3f,%.3f,%.3f,%.5f,%.5f,%.5f,%.3f,%lld,%.3e,%lld,%lld,%s\n",
+                        std::fprintf(csv, "%lld,%lld,%lld,%lld,%d,%.2f,%.2f,%.3f,%.1f,%.3f,%.3f,%.3f,%.5f,%.5f,%.5f,%.3f,%lld,%.3e,%lld,%lld,%s,%.1f\n",
                                      (long long)bits, (long long)nprobe, (long long)C, (long long)nq, batch,
                                      index_mb, work_mb, scan_ms, nq / (scan_ms / 1e3), parts.coarse, parts.scan,
                                      parts.select, cand_recall, no_rerank, reranked, median(rerank_times),
                                      (long long)nc, chk.max_rel, (long long)chk.mismatch, (long long)rerank_mismatch,
-                                     topc_name.c_str());
+                                     topc_name.c_str(), codes_mb);
                 }
             }
         }

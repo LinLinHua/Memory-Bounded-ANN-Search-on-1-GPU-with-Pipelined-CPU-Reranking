@@ -4,22 +4,28 @@
 Both libraries do the same job as our GPU stage: return C candidates per query. Recall is
 computed after the same exact rerank (NumPy, not timed), so the numbers line up with bench_scan.
 
-  ivf_flat : FP32 vectors in the lists (4 * d bytes per vector), the full-precision reference
-  ivf_pq   : pq_dim = d / 2 sub-vectors of 8 bits (d / 2 bytes per vector, same size as our 4-bit)
+  ivf_flat  : FP32 vectors in the lists (4 * d bytes per vector), the full-precision reference
+  ivf_pq    : pq_dim = d / 2 sub-vectors of 8 bits (d / 2 bytes per vector, same size as our 4-bit)
+  ivf_pq_d4 : pq_dim = d / 4 (d / 4 bytes per vector, about our 1-bit index size)
+  ivf_pq_d8 : pq_dim = d / 8 (d / 8 bytes per vector)
 
-By default the queries are on the GPU before timing starts and all of them go to one search call.
-To time it the way bench_scan times our scan:
+Timing follows docs/measurement.md: one warm-up, then the median of --reps searches of all
+queries, each starting from queries in pinned host memory and ending with ids and distances back
+on the host (--transfer 1, the default), in calls of --batch queries.
+codes_mb is n x bytes per vector; gpu_index_mb is device memory the index holds after build
+(cudaMemGetInfo, cupy pool emptied).
+
   --batch B      queries per search call (0 = all at once, the default)
-  --transfer 1   the timed loop starts from queries in pinned host memory: upload each batch,
-                 search, and download its ids and distances (bench_scan does the same)
+  --transfer 0   queries already on the GPU and results left there (the timing before Nov 25)
 
 Usage:
   cuvs_baseline.py --base B --query Q --gt G --nlist 1024 [--nprobe 16,32,64] [--C 100,1000]
-                   [--algo ivf_pq,ivf_flat] [--reps 5] [--batch 0] [--transfer 0]
+                   [--algo ivf_pq,ivf_pq_d4,ivf_flat] [--reps 5] [--batch 0] [--transfer 1]
                    [--csv results/cuvs_sift.csv]
 """
 import argparse
 import csv
+import gc
 import os
 import time
 
@@ -69,6 +75,12 @@ def timed_search(search, reps):
     return result, float(np.median(times))
 
 
+def used_mb():
+    """Device memory in use on this GPU (whole device, so one job per GPU)."""
+    free, total = cp.cuda.runtime.memGetInfo()
+    return (total - free) / 2**20
+
+
 def batched_search(module, params, index, queries, C, batch, transfer):
     """Searches `queries` in calls of `batch` queries (0 = one call). With transfer, `queries` is
     pinned host memory: each batch is uploaded, searched, and its results are downloaded."""
@@ -101,7 +113,7 @@ def main():
     p.add_argument("--algo", default="ivf_pq,ivf_flat")
     p.add_argument("--reps", type=int, default=5)
     p.add_argument("--batch", type=int, default=0, help="queries per search call (0 = all)")
-    p.add_argument("--transfer", type=int, default=0, help="1 = time upload and download too")
+    p.add_argument("--transfer", type=int, default=1, help="0 = queries and results stay on the GPU")
     p.add_argument("--csv", default="")
     a = p.parse_args()
 
@@ -116,21 +128,29 @@ def main():
     search_queries = queries_pinned if a.transfer else queries_gpu
     print(f"batch {a.batch or 'all'}, transfer timed: {bool(a.transfer)}")
 
+    pq_div = {"ivf_pq": 2, "ivf_pq_d4": 4, "ivf_pq_d8": 8}
     rows = []
     for algo in a.algo.split(","):
+        if algo not in pq_div and algo != "ivf_flat":
+            p.error(f"unknown algo {algo}; expected ivf_flat or one of {','.join(pq_div)}")
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.cuda.Device().synchronize()
+        before = used_mb()
         t0 = time.perf_counter()
-        if algo == "ivf_pq":
+        if algo in pq_div:
             module = ivf_pq
             index = ivf_pq.build(ivf_pq.IndexParams(n_lists=a.nlist, metric="sqeuclidean",
-                                                    pq_dim=d // 2, pq_bits=8), base_gpu)
-            index_mb = n * (d // 2) / 2**20
+                                                    pq_dim=d // pq_div[algo], pq_bits=8), base_gpu)
+            index_mb = n * (d // pq_div[algo]) / 2**20
         else:
             module = ivf_flat
             index = ivf_flat.build(ivf_flat.IndexParams(n_lists=a.nlist, metric="sqeuclidean"), base_gpu)
             index_mb = n * d * 4 / 2**20
         cp.cuda.Device().synchronize()
         build_s = time.perf_counter() - t0
-        print(f"=== {algo}: build {build_s:.1f} s, codes {index_mb:.0f} MB")
+        cp.get_default_memory_pool().free_all_blocks()
+        gpu_index_mb = used_mb() - before
+        print(f"=== {algo}: build {build_s:.1f} s, codes {index_mb:.0f} MB, on GPU {gpu_index_mb:.0f} MB")
 
         for nprobe in map(int, a.nprobe.split(",")):
             for C in map(int, a.C.split(",")):
@@ -146,7 +166,10 @@ def main():
                 rows.append(dict(algo=algo, nlist=a.nlist, nprobe=nprobe, C=C, nq=len(queries),
                                  search_ms=round(ms, 3), qps=round(qps, 1), index_mb=round(index_mb, 1),
                                  build_s=round(build_s, 2), recall10_no_rerank=round(no_rerank, 5),
-                                 recall10_rerank=round(reranked, 5), batch=a.batch, transfer=a.transfer))
+                                 recall10_rerank=round(reranked, 5), batch=a.batch, transfer=a.transfer,
+                                 codes_mb=round(index_mb, 1), gpu_index_mb=round(gpu_index_mb, 1)))
+        del index  # release it before the next index's memory baseline
+        gc.collect()
 
     if a.csv:
         os.makedirs(os.path.dirname(a.csv) or ".", exist_ok=True)

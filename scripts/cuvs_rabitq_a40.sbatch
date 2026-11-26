@@ -42,7 +42,7 @@ for ds in ${DATASETS:-sift deep10m}; do
         csv="results/cuvs_rabitq_${ds}${tag}.csv"
         rm -f "$csv"
         echo "=== IVF-RaBitQ on $ds, batch $batch"
-        "$BIN" "${args[@]}" --bits 1,2,3,4 --nprobe 8,16,32,64,128 --C 100,300,1000 --reps 3 \
+        "$BIN" "${args[@]}" --bits 1,2,3,4 --nprobe 8,16,32,64,128 --C 100,300,1000 --reps 5 \
             --batch "$batch" --csv "$csv" "$@" || { echo "FAILED: $ds batch $batch"; status=1; }
     done
 done
