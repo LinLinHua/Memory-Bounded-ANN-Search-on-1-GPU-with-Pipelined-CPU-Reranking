@@ -85,16 +85,17 @@ def result_budget(res):
     out = []
     keys = sorted({k[:5] for k in rows}, key=lambda k: (k[0], int(k[1]), int(k[4])))
     for k in keys:
-        over = rows.get(k + ("over_budget",))
+        over = rows.get(k + ("over_budget",)) or rows.get(k + ("unsupported",))
         s, p = rows.get(k + ("sequential",)), rows.get(k + ("pipelined",))
         if over and not s:
-            out.append([k[0], k[1], k[2], k[3], k[4], over["budget_mb"], "over", "-", "-", "-", "-", "-", "-"])
+            status = "over" if over["mode"] == "over_budget" else "n/a"
+            out.append([k[0], k[1], k[2], k[3], k[4], over["budget_mb"], status, "-", "-", "-", "-", "-", "-"])
         elif s and p:
             out.append([k[0], k[1], k[2], k[3], k[4], s["budget_mb"], "fits", f(s["index_mb"], 1),
-                        f(s["work_mb"], 1), f(s["measured_peak_mb"], 1), f(s["recall10"], 4), f(s["qps"], 0),
-                        f(p["qps"], 0)])
+                        f(s["work_mb"], 1), f(s.get("gpu_peak_mb") or s["measured_peak_mb"], 1),
+                        f(s["recall10"], 4), f(s["qps"], 0), f(p["qps"], 0)])
     table(["data", "bits", "topc", "C", "batch", "budget_MiB", "status", "index_MiB", "work_MiB",
-           "measured_MiB", "R@10", "seq_qps", "pipe_qps"], out)
+           "gpu_peak_MiB", "R@10", "seq_qps", "pipe_qps"], out)
 
 
 def result5(res):

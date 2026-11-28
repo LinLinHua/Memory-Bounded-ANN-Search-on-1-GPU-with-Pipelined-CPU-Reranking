@@ -18,6 +18,7 @@
 cd "$SLURM_SUBMIT_DIR"
 source scripts/env.sh
 set -euo pipefail
+export CUDA_MODULE_LOADING=EAGER  # kernels in the memory baseline (docs/measurement.md)
 
 BUILD="build/${SLURM_JOB_ID}"
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
@@ -44,7 +45,7 @@ for ds in ${DATASETS:-sift deep10m}; do
             read -r bits topc C <<< "$cfg"
             echo "=== $ds: budget 1/$den = $budget MiB, $bits-bit $topc, C $C"
             "$BUILD/bench_pipeline" "${data[@]}" --label "$ds@1/$den" --bits "$bits" --topc "$topc" \
-                --nprobe 64 --C "$C" --batch 16,64,256,1024 --reps 3 --budget-mb "$budget" \
+                --nprobe 64 --C "$C" --batch 16,64,128,256,1024 --reps 3 --budget-mb "$budget" \
                 --csv results/xj_pipeline_budget.csv \
                 || { echo "FAILED: $ds 1/$den $cfg"; status=1; }
         done

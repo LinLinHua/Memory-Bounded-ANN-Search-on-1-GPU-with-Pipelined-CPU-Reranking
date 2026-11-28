@@ -18,6 +18,11 @@
 // Latency is the time from the start of a batch's scan to the end of its rerank, with every query
 // available at the start. It is the per-batch service time, not a latency under an arrival process.
 //
+// Device memory follows docs/measurement.md: the baseline has the CUDA context and cuBLAS loaded
+// (run with CUDA_MODULE_LOADING=EAGER), gpu_index_mb is in use once the scanner is built, and
+// gpu_peak_mb is the most seen during one extra, untimed pipelined run, sampled every 0.1 ms.
+// The timed region is the scanner's (queries on the host -> candidates on the host) plus the rerank.
+//
 // Usage:
 //   bench_pipeline --base B --query Q --gt G --index DIR [--label sift]
 //                  [--bits 4] [--topc fused] [--nprobe 64] [--C 100]
@@ -29,6 +34,7 @@
 #include <omp.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -225,6 +231,46 @@ int64_t pipeline_race_check(IvfScanner& scanner, const Workload& w) {
     return count_diff(pipe.ids, pipe.dists, ids, dists);
 }
 
+// Loads cuBLAS (handle + one tiny GEMM) so it is in the memory baseline, as in bench_scan.cu.
+void load_cublas() {
+    cublasHandle_t h;
+    if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasCreate failed");
+    float* m = nullptr;
+    CUDA_CHECK(cudaMalloc(&m, 3 * 32 * 32 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(m, 0, 3 * 32 * 32 * sizeof(float)));
+    const float one = 1.0f, zero = 0.0f;
+    cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, 32, 32, 32, &one, m, 32, m + 1024, 32, &zero, m + 2048, 32);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaFree(m));
+    cublasDestroy(h);
+}
+
+// Device memory in use on the whole GPU (MiB); one job per GPU, so it is ours.
+double used_mb() {
+    size_t free = 0, total = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free, &total));
+    return (total - free) / double(1 << 20);
+}
+
+// Runs fn() while another thread samples device memory every 0.1 ms; returns the highest reading.
+template <typename F>
+double peak_during(F fn) {
+    std::atomic<bool> done{false};
+    std::atomic<double> peak{used_mb()};
+    std::thread sampler([&] {
+        cudaSetDevice(0);
+        while (!done) {
+            double u = used_mb(), p = peak.load();
+            while (u > p && !peak.compare_exchange_weak(p, u)) {}
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    });
+    fn();
+    done = true;
+    sampler.join();
+    return std::max(peak.load(), used_mb());
+}
+
 // Runs one mode reps + 1 times (the first is warm-up) and keeps the run with the median total.
 template <typename Fn>
 RunResult median_run(Fn run, int reps) {
@@ -284,34 +330,46 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
         CUDA_CHECK(cudaSetDevice(0));
         CUDA_CHECK(cudaFree(nullptr));
+        load_cublas();
+        std::printf("device memory with CUDA and cuBLAS loaded: %.0f MiB (the baseline)\n", used_mb());
 
         FILE* csv = open_csv(csv_path,
                              "label,bits,topc,nprobe,C,batch,nq,threads,prefetch,mode,total_ms,qps,scan_ms,"
                              "rerank_ms,predicted_speedup,speedup,lat_p50_ms,lat_p99_ms,lat_mean_ms,recall10,"
-                             "mismatch,seq_pipe_diff,index_mb,work_mb,budget_mb,peak_mb,measured_peak_mb");
+                             "mismatch,seq_pipe_diff,index_mb,work_mb,budget_mb,peak_mb,measured_peak_mb,codes_mb,"
+                             "gpu_index_mb,gpu_peak_mb");
         bool all_ok = true;
 
         for (const int64_t batch : batch_list) {
             // A fresh budget per batch size: the peak is per setting, and a scanner whose buffers do
             // not fit leaves nothing behind (the budget frees what it allocated).
+            const double codes_mb = double(n) * d * bits / 8.0 / double(1 << 20);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            const double mem_before = used_mb();
             DeviceBudget budget(static_cast<size_t>(budget_mb) << 20);
             std::unique_ptr<IvfScanner> scanner_ptr;
             try {
                 scanner_ptr = std::make_unique<IvfScanner>(ix, bits, static_cast<int>(batch), nprobe, C, budget, topc);
             } catch (const std::runtime_error& e) {
-                if (std::string(e.what()).rfind("budget exceeded", 0) != 0) throw;
-                std::printf("\n=== batch %lld  OVER BUDGET (%lld MB): %s\n", (long long)batch,
-                            (long long)budget_mb, e.what());
+                // Over the budget, or a setting the scanner does not support (select with a batch so
+                // large that its estimates exceed 2^31): record it and go on.
+                const bool over = std::string(e.what()).rfind("budget exceeded", 0) == 0;
+                if (!over && std::string(e.what()).find("too large") == std::string::npos) throw;
+                std::printf("\n=== batch %lld  %s (budget %lld MB): %s\n", (long long)batch,
+                            over ? "OVER BUDGET" : "UNSUPPORTED", (long long)budget_mb, e.what());
                 if (csv) {
-                    std::fprintf(csv, "%s,%d,%s,%d,%d,%lld,%lld,%d,%d,over_budget,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-                                      "%lld,%.2f,%.2f\n",
+                    std::fprintf(csv, "%s,%d,%s,%d,%d,%lld,%lld,%d,%d,%s,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
+                                      "%lld,%.2f,%.2f,%.1f,0,0\n",
                                  label.c_str(), bits, topc_name.c_str(), nprobe, C, (long long)batch,
-                                 (long long)nq, threads, prefetch, (long long)budget_mb,
-                                 budget.peak() / double(1 << 20), budget.measured_peak() / double(1 << 20));
+                                 (long long)nq, threads, prefetch, over ? "over_budget" : "unsupported",
+                                 (long long)budget_mb, budget.peak() / double(1 << 20),
+                                 budget.measured_peak() / double(1 << 20), codes_mb);
                     std::fflush(csv);
                 }
                 continue;
             }
+            CUDA_CHECK(cudaDeviceSynchronize());
+            const double gpu_index_mb = used_mb() - mem_before;
             IvfScanner& scanner = *scanner_ptr;
             const double index_mb = scanner.index_bytes() / double(1 << 20);
             const double work_mb = scanner.work_bytes() / double(1 << 20);
@@ -320,6 +378,7 @@ int main(int argc, char** argv) {
             const RunResult seq = median_run([&] { return run_sequential(scanner, w); }, reps);
             const RunResult pipe = median_run([&] { return run_pipelined(scanner, w); }, reps);
             const int64_t mismatch = pipeline_race_check(scanner, w);
+            const double gpu_peak_mb = peak_during([&] { run_pipelined(scanner, w); }) - mem_before;
             const int64_t seq_pipe_diff = count_diff(seq.ids, seq.dists, pipe.ids, pipe.dists);
             all_ok = all_ok && mismatch == 0;
 
@@ -344,7 +403,7 @@ int main(int argc, char** argv) {
                 if (csv)
                     std::fprintf(csv,
                                  "%s,%d,%s,%d,%d,%lld,%lld,%d,%d,%s,%.3f,%.1f,%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,"
-                                 "%.4f,%.5f,%lld,%lld,%.2f,%.2f,%lld,%.2f,%.2f\n",
+                                 "%.4f,%.5f,%lld,%lld,%.2f,%.2f,%lld,%.2f,%.2f,%.1f,%.1f,%.1f\n",
                                  label.c_str(), bits, topc_name.c_str(), nprobe, C, (long long)batch,
                                  (long long)nq, threads, prefetch, is_seq ? "sequential" : "pipelined",
                                  run->total_ms, nq / (run->total_ms / 1e3), run->scan_ms, run->rerank_ms,
@@ -352,9 +411,11 @@ int main(int argc, char** argv) {
                                  percentile(run->latency, 0.99), mean, is_seq ? recall : recall_pipe,
                                  (long long)mismatch, (long long)seq_pipe_diff, index_mb,
                                  work_mb, (long long)budget_mb, budget.peak() / double(1 << 20),
-                                 budget.measured_peak() / double(1 << 20));
+                                 budget.measured_peak() / double(1 << 20), codes_mb, gpu_index_mb,
+                                 gpu_peak_mb);
             }
-            std::printf("speedup measured %.3f  predicted %.3f\n", speedup, predicted);
+            std::printf("speedup measured %.3f  predicted %.3f  gpu index %.0f MiB peak %.0f MiB\n", speedup,
+                        predicted, gpu_index_mb, gpu_peak_mb);
             if (csv) std::fflush(csv);
             budget.report(stdout);
         }

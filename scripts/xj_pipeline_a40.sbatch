@@ -21,6 +21,7 @@
 cd "$SLURM_SUBMIT_DIR"
 source scripts/env.sh
 set -euo pipefail
+export CUDA_MODULE_LOADING=EAGER  # kernels in the memory baseline (docs/measurement.md)
 
 BUILD="build/${SLURM_JOB_ID}"
 CORES=${SLURM_CPUS_PER_TASK:-16}
@@ -67,7 +68,7 @@ for ds in ${DATASETS:-sift deep10m}; do
                 read -r bits topc C <<< "$cfg"
                 echo "=== $ds: pipeline, $bits-bit $topc, C $C"
                 "$BUILD/bench_pipeline" "${data[@]}" --label "$ds" --bits "$bits" --topc "$topc" \
-                    --nprobe 64 --C "$C" --batch 1,16,64,256,1024 --reps 5 \
+                    --nprobe 64 --C "$C" --batch 1,16,64,128,256,1024,10000 --reps 5 \
                     --csv results/xj_pipeline.csv \
                     || { echo "FAILED: $ds pipeline $cfg"; status=1; }
             done
