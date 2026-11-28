@@ -22,7 +22,8 @@ process. Within one process the CPU and GPU versions of an encoding hold the sam
 GPU index is a copy of the CPU one).
 
 GPU memory follows the proposal: no Faiss temporary-memory pool (--temp-mb 0), and memory is
-reported above the CUDA context. gpu_index_mb is the device memory held after the index is
+reported above the CUDA context (docs/measurement.md): everything Faiss allocates after that,
+its handles and workspaces included, is counted. gpu_index_mb is the device memory held after the index is
 on the GPU (codes, IDs, centroids, Faiss's handles); gpu_peak_mb is the most seen during one
 extra, untimed search, sampled with cudaMemGetInfo every 0.1 ms, so very short spikes can be
 missed. Run with CUDA_MODULE_LOADING=EAGER (scripts/faiss_baseline_a40.sbatch does): then the

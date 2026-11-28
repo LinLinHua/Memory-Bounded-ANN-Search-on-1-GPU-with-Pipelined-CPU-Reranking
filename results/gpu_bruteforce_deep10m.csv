@@ -1,0 +1,2 @@
+base,n,d,nq,k,qbatch,chunk,search_ms,qps,recall,check_queries,max_rel_err,rank_mismatch
+data/deep10m/base.10M.fbin,10000000,96,10000,100,1024,262144,2534.932,3944.9,-1.000000,20,5.340e-07,0

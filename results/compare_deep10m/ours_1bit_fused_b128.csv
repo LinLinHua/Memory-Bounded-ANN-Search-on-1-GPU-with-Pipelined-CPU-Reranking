@@ -1,0 +1,3 @@
+bits,nprobe,C,nq,batch,index_mb,work_mb,scan_ms,qps,coarse_ms,scan_kernel_ms,select_ms,cand_recall,recall10_no_rerank,recall10_rerank,cpu_rerank_ms,check_queries,max_rel_err,scan_mismatch,rerank_mismatch,topc,codes_mb,gpu_index_mb,gpu_peak_mb
+1,64,100,10000,128,231.96,65.63,166.926,59906.7,16.673,141.311,6.201,0.87027,0.38667,0.87000,8.530,20,0.000e+00,0,0,fused,114.4,314.0,314.0
+1,64,1000,10000,128,231.96,65.63,203.736,49083.1,16.836,147.976,32.541,0.98384,0.38674,0.98359,65.589,20,0.000e+00,0,0,fused,114.4,314.0,314.0

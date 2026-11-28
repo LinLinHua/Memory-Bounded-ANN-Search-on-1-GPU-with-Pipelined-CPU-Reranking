@@ -1,0 +1,4 @@
+algo,nlist,nprobe,C,nq,search_ms,qps,index_mb,build_s,recall10_no_rerank,recall10_rerank,device,rerank_timed,batch,threads,temp_mb,gpu_index_mb,gpu_peak_mb,pq_lut_fp16,faiss,pq_m,gpu_id_bits
+gpu_ivf_sq8,1024,64,100,10000,325.315,30739.4,122.1,5.18,0.98236,0.99571,gpu,0,128,16,0,138.0,154.0,0,1.14.1,,32
+gpu_ivf_sq4,1024,64,100,10000,361.956,27627.7,61.0,5.25,0.80659,0.99551,gpu,0,128,16,0,76.0,92.0,0,1.14.1,,32
+gpu_ivf_flat,1024,64,100,10000,662.826,15086.9,488.3,5.25,0.99576,0.99576,gpu,0,128,16,0,530.0,546.0,0,1.14.1,,32

@@ -1,20 +1,24 @@
 // cuVS IVF-RaBitQ baseline (HS). cuVS has no Python binding for it yet, so this is C++.
 //
 // Same job and CSV columns as src/cuvs_baseline.py: return C candidates per query, then recall
-// after an exact rerank on the CPU (not timed). The timed search includes copying the
-// candidates to the host, because the rerank needs them there.
+// after an exact rerank on the CPU (not timed). Timing follows docs/measurement.md: each timed
+// search starts from the queries in pinned host memory, uploads each batch, and copies the
+// candidates back to the host (--transfer 1, the default). --transfer 0 keeps the queries on
+// the GPU before timing starts (the timing before Nov 25).
 //
 //   bits_per_dim 1      1 bit per dimension (binary RaBitQ, like our 1-bit codes)
 //   bits_per_dim 2..9   extended RaBitQ with more bits per dimension (4 = our 4-bit size)
 //
 // Device memory comes from cudaMemGetInfo: gpu_index_mb is what the index holds after build,
 // gpu_peak_mb the most seen during one extra, untimed search (sampled every 0.1 ms), both
-// above the baseline taken after the CUDA context and cuVS handle exist. Run it with
+// above the baseline taken after the CUDA context and cuVS handle exist, so cuVS's workspace is
+// counted (--warmup 1 builds a throwaway index first; that keeps ~640 MB of workspace out of the
+// numbers, so it is for the ablation only). Run it with
 // CUDA_MODULE_LOADING=EAGER so the kernels' code is in that baseline, as for Faiss.
 //
 // Usage:
 //   cuvs_rabitq_bench --base B --query Q --gt G --nlist 1024 [--bits 1,2,3,4]
-//                     [--nprobe 16,32,64] [--C 100,1000] [--batch 0] [--reps 5]
+//                     [--nprobe 16,32,64] [--C 100,1000] [--batch 0] [--reps 5] [--transfer 1]
 //                     [--mode quant4|quant8|lut16|lut32] [--csv results/cuvs_rabitq_sift.csv]
 
 #include <cuda_runtime.h>
@@ -34,6 +38,7 @@
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_resources.hpp>
 #include <raft/core/host_mdspan.hpp>
+#include <raft/core/resource/cublas_handle.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
 
 #include "cli_utils.h"
@@ -128,10 +133,12 @@ int main(int argc, char** argv) {
         const std::string gt_path = args.required("gt"), csv_path = args.str("csv");
         const int64_t nlist = args.num("nlist", 1024), batch_arg = args.num("batch", 0);
         const int reps = static_cast<int>(args.num("reps", 5));
+        const bool transfer = args.num("transfer", 1) != 0;
         const auto bits_list = args.list("bits", "1,2,3,4");
         const auto nprobe_list = args.list("nprobe", "16,32,64");
         const auto c_list = args.list("C", "100,1000");
         const std::string mode_name = args.str("mode", "quant4");
+        const bool warmup = args.num("warmup", 0) != 0;  // 1: throwaway index before the baseline (hides ~640 MB of cuVS workspace; ablation only)
         const rq::search_mode mode = parse_mode(mode_name);
         args.reject_unknown();
 
@@ -149,29 +156,62 @@ int main(int argc, char** argv) {
         CUDA_OK(cudaFree(nullptr));
         raft::device_resources handle;
         auto stream = raft::resource::get_cuda_stream(handle);
+        {  // load cuBLAS (handle + one tiny GEMM) before the baseline, as in every benchmark
+            cublasHandle_t h = raft::resource::get_cublas_handle(handle);
+            float* m = nullptr;
+            CUDA_OK(cudaMalloc(&m, 3 * 32 * 32 * sizeof(float)));
+            CUDA_OK(cudaMemset(m, 0, 3 * 32 * 32 * sizeof(float)));
+            const float one = 1.0f, zero = 0.0f;
+            cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, 32, 32, 32, &one, m, 32, m + 1024, 32, &zero, m + 2048, 32);
+            CUDA_OK(cudaDeviceSynchronize());
+            CUDA_OK(cudaFree(m));
+        }
         const double context_mb = used_mb();
-        std::printf("device memory with the CUDA context and handle: %.0f MB (subtracted below)\n", context_mb);
+        std::printf("device memory with the CUDA context, handle and cuBLAS: %.0f MB\n", context_mb);
 
         FILE* csv = open_csv(csv_path,
                              "algo,nlist,nprobe,C,nq,search_ms,qps,index_mb,build_s,recall10_no_rerank,"
                              "recall10_rerank,batch,gpu_index_mb,gpu_peak_mb,rerank_timed,bits_per_dim,mode,cuvs");
 
         auto queries_d = raft::make_device_matrix<float, int64_t>(handle, nq, d);
-        raft::copy(queries_d.data_handle(), queries.data(), nq * d, stream);
+        float* queries_pinned = nullptr;  // where each timed search starts when transfer is on
+        CUDA_OK(cudaMallocHost(&queries_pinned, nq * d * sizeof(float)));
+        std::copy(queries.begin(), queries.end(), queries_pinned);
+        if (!transfer) raft::copy(queries_d.data_handle(), queries_pinned, nq * d, stream);
         raft::resource::sync_stream(handle);
+
+        if (warmup) {  // throwaway warm-up on the first 100,000 vectors: cuVS's one-time setup goes into the baseline
+            const int64_t wn = std::min<int64_t>(n, 100000), wq = std::min<int64_t>(nq, 128);
+            rq::index_params wp;
+            wp.n_lists = static_cast<uint32_t>(std::min<int64_t>(nlist, wn / 32));
+            wp.bits_per_dim = static_cast<uint32_t>(bits_list[0]);
+            auto warm = rq::build(handle, wp, raft::make_host_matrix_view<const float, int64_t>(base.data(), wn, d));
+            rq::search_params sp;
+            sp.n_probes = 16;
+            sp.mode = mode;
+            auto wn_d = raft::make_device_matrix<int64_t, int64_t>(handle, wq, 100);
+            auto wd_d = raft::make_device_matrix<float, int64_t>(handle, wq, 100);
+            raft::copy(queries_d.data_handle(), queries_pinned, wq * d, stream);
+            rq::search(handle, sp, warm,
+                       raft::make_device_matrix_view<const float, int64_t>(queries_d.data_handle(), wq, d),
+                       wn_d.view(), wd_d.view());
+            raft::resource::sync_stream(handle);
+        }
+        CUDA_OK(cudaDeviceSynchronize());
+        const double base_mb = used_mb();
+        std::printf("device memory after the warm-up: %.0f MB (the baseline subtracted below)\n", base_mb);
 
         for (int64_t bits : bits_list) {
             rq::index_params ip;
             ip.n_lists = static_cast<uint32_t>(nlist);
             ip.bits_per_dim = static_cast<uint32_t>(bits);
-            const double before = used_mb();
             const auto t0 = Clock::now();
             // From host memory: no full-precision copy of the dataset stays on the GPU.
             auto index = rq::build(handle, ip,
                                    raft::make_host_matrix_view<const float, int64_t>(base.data(), n, d));
             raft::resource::sync_stream(handle);
             const double build_s = std::chrono::duration<double>(Clock::now() - t0).count();
-            const double gpu_index_mb = used_mb() - before;
+            const double gpu_index_mb = used_mb() - base_mb;
             const double index_mb = n * d * bits / 8.0 / kMB;
             const std::string algo = "ivf_rabitq_b" + std::to_string(bits);
             std::printf("=== %s: build %.1f s, codes %.0f MB, on GPU %.1f MB\n", algo.c_str(), build_s,
@@ -188,6 +228,8 @@ int main(int argc, char** argv) {
                     auto search_all = [&] {
                         for (int64_t off = 0; off < nq; off += batch) {
                             const int64_t b = std::min(batch, nq - off);
+                            if (transfer)
+                                raft::copy(queries_d.data_handle() + off * d, queries_pinned + off * d, b * d, stream);
                             rq::search(handle, sp, index,
                                        raft::make_device_matrix_view<const float, int64_t>(
                                            queries_d.data_handle() + off * d, b, d),
@@ -206,7 +248,7 @@ int main(int argc, char** argv) {
                     }
                     const double ms = median(times);
                     // Index, queries and output buffers are all on the device during the search.
-                    const double peak_mb = peak_during(search_all) - context_mb;
+                    const double peak_mb = peak_during(search_all) - base_mb;
                     const double no_rerank = recall_at_10(cand, C, gt, kgt, nq);
                     const double reranked = recall_at_10(exact_rerank(base, queries, d, cand, C, nq), 10, gt, kgt, nq);
                     const double qps = nq / (ms / 1e3);
@@ -225,6 +267,7 @@ int main(int argc, char** argv) {
             }
         }
         if (csv) std::fclose(csv);
+        cudaFreeHost(queries_pinned);
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());

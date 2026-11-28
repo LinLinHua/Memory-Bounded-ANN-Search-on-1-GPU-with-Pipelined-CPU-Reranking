@@ -12,13 +12,22 @@
 //              [--bits 8,1] [--nprobe 16,32,64] [--C 100,1000] [--nq 10000] [--batch 256]
 //              [--check 100] [--reps 5] [--budget-mb 16384] [--csv results/scan_sift.csv]
 //              [--topc fused|select|sort]   (see ivf_scan.cuh; fused is the default)
+//
+// Device memory (docs/measurement.md), the same way as every baseline: cudaMemGetInfo above the
+// memory in use just before the scanner is created (CUDA context and cuBLAS loaded, as for every
+// baseline), so every allocation the scanner makes, workspaces included, is counted.
+// gpu_index_mb is what the scanner holds once built (our index and work buffers are allocated
+// together); gpu_peak_mb is the most seen during one extra, untimed search, sampled every 0.1 ms.
 
+#include <cublas_v2.h>
 #include <omp.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -168,6 +177,47 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
 
 }  // namespace
 
+// Loads cuBLAS (handle + one tiny GEMM) so its kernels and library state are in the memory
+// baseline, as they are for Faiss, whose GPU k-means runs before its baseline.
+void load_cublas() {
+    cublasHandle_t h;
+    if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasCreate failed");
+    float* m = nullptr;
+    CUDA_CHECK(cudaMalloc(&m, 3 * 32 * 32 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(m, 0, 3 * 32 * 32 * sizeof(float)));
+    const float one = 1.0f, zero = 0.0f;
+    cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, 32, 32, 32, &one, m, 32, m + 1024, 32, &zero, m + 2048, 32);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaFree(m));
+    cublasDestroy(h);
+}
+
+// Device memory in use on the whole GPU (MB); one job per GPU, so it is ours.
+double used_mb() {
+    size_t free = 0, total = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free, &total));
+    return (total - free) / double(1 << 20);
+}
+
+// Runs fn() while another thread samples device memory; returns the highest reading (MB).
+template <typename F>
+double peak_during(F fn) {
+    std::atomic<bool> done{false};
+    std::atomic<double> peak{used_mb()};
+    std::thread sampler([&] {
+        cudaSetDevice(0);
+        while (!done) {
+            double u = used_mb(), p = peak.load();
+            while (u > p && !peak.compare_exchange_weak(p, u)) {}
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    });
+    fn();
+    done = true;
+    sampler.join();
+    return std::max(peak.load(), used_mb());
+}
+
 int main(int argc, char** argv) {
     try {
         const Args args(argc, argv);
@@ -226,13 +276,22 @@ int main(int argc, char** argv) {
         FILE* csv = open_csv(csv_path,
                              "bits,nprobe,C,nq,batch,index_mb,work_mb,scan_ms,qps,coarse_ms,scan_kernel_ms,"
                              "select_ms,cand_recall,recall10_no_rerank,recall10_rerank,cpu_rerank_ms,"
-                             "check_queries,max_rel_err,scan_mismatch,rerank_mismatch,topc");
+                             "check_queries,max_rel_err,scan_mismatch,rerank_mismatch,topc,codes_mb,gpu_index_mb,gpu_peak_mb");
         bool all_ok = true;
 
+        load_cublas();
+        std::printf("device memory with CUDA and cuBLAS loaded: %.0f MB (the baseline)\n", used_mb());
+
         for (const int64_t bits : bits_list) {
+            CUDA_CHECK(cudaDeviceSynchronize());
+            const double mem_before = used_mb();
             IvfScanner scanner(ix, static_cast<int>(bits), batch, max_nprobe, max_C, budget, topc);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            const double gpu_index_mb = used_mb() - mem_before;
             const double index_mb = scanner.index_bytes() / double(1 << 20);
             const double work_mb = scanner.work_bytes() / double(1 << 20);
+            // Codes only (n x d x bits / 8), the same definition as the baselines' codes_mb / index_mb.
+            const double codes_mb = double(n) * d * bits / 8.0 / double(1 << 20);
             std::printf("\n=== %lld-bit  top-C %s  index %.1f MB  work buffers %.1f MB\n", (long long)bits, topc_name.c_str(), index_mb, work_mb);
 
             for (const int64_t nprobe : nprobe_list) {
@@ -250,6 +309,9 @@ int main(int argc, char** argv) {
                         parts = scanner.timing();
                     }
                     const double scan_ms = median(times);
+                    const double gpu_peak_mb = peak_during([&] {
+                        scanner.search(queries.data(), nq, int(nprobe), int(C), cand.data(), est.data());
+                    }) - mem_before;
 
                     // CPU rerank of the candidates (XJ's code)
                     std::vector<int32_t> cpu_ids(nq * kRecallK);
@@ -288,17 +350,17 @@ int main(int argc, char** argv) {
 
                     std::printf("nprobe=%-3lld C=%-4lld scan_ms=%7.1f qps=%8.0f (coarse %.1f, scan %.1f, select %.1f)  "
                                 "cand_recall=%.4f R@10 no_rerank=%.4f rerank=%.4f cpu_rerank_ms=%.1f  "
-                                "check: max_rel=%.1e scan_mismatch=%lld rerank_mismatch=%lld\n",
+                                "check: max_rel=%.1e scan_mismatch=%lld rerank_mismatch=%lld  gpu index %.0f MB peak %.0f MB\n",
                                 (long long)nprobe, (long long)C, scan_ms, nq / (scan_ms / 1e3), parts.coarse,
                                 parts.scan, parts.select, cand_recall, no_rerank, reranked, median(rerank_times),
-                                chk.max_rel, (long long)chk.mismatch, (long long)rerank_mismatch);
+                                chk.max_rel, (long long)chk.mismatch, (long long)rerank_mismatch, gpu_index_mb, gpu_peak_mb);
                     if (csv)
-                        std::fprintf(csv, "%lld,%lld,%lld,%lld,%d,%.2f,%.2f,%.3f,%.1f,%.3f,%.3f,%.3f,%.5f,%.5f,%.5f,%.3f,%lld,%.3e,%lld,%lld,%s\n",
+                        std::fprintf(csv, "%lld,%lld,%lld,%lld,%d,%.2f,%.2f,%.3f,%.1f,%.3f,%.3f,%.3f,%.5f,%.5f,%.5f,%.3f,%lld,%.3e,%lld,%lld,%s,%.1f,%.1f,%.1f\n",
                                      (long long)bits, (long long)nprobe, (long long)C, (long long)nq, batch,
                                      index_mb, work_mb, scan_ms, nq / (scan_ms / 1e3), parts.coarse, parts.scan,
                                      parts.select, cand_recall, no_rerank, reranked, median(rerank_times),
                                      (long long)nc, chk.max_rel, (long long)chk.mismatch, (long long)rerank_mismatch,
-                                     topc_name.c_str());
+                                     topc_name.c_str(), codes_mb, gpu_index_mb, gpu_peak_mb);
                 }
             }
         }

@@ -27,7 +27,7 @@ SIFT=(--base data/sift/sift_base.fvecs --query data/sift/sift_query.fvecs
       --gt data/sift/sift_groundtruth.ivecs --index data/sift/ivf1024)
 DEEP=(--base data/deep10m/base.10M.fbin --query data/deep10m/query.public.10K.fbin
       --gt data/deep10m/deep10m_groundtruth.ivecs --index data/deep10m/ivf4096)
-SWEEP=(--bits 8,4,1 --nprobe 8,16,32,64,128 --C 100,300,1000 --check 20 --reps 3)
+SWEEP=(--bits 8,4,1 --nprobe 8,16,32,64,128 --C 100,300,1000 --check 20 --reps 5)
 
 hostname
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
